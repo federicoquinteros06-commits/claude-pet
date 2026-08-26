@@ -8,6 +8,71 @@ tocarle el código.
 
 ## Trampas del entorno
 
+Esta seccion tiene dos mitades: la maquina Windows donde nacio el proyecto y
+la Mac donde se porto el 25/8/2026. Ninguna aplica a la otra.
+
+### macOS (portado el 25/8/2026, macOS 26.6.2 arm64)
+
+**El `python3` del sistema es 3.9.6 de CommandLineTools.** No hay Homebrew. Se
+usa un venv aparte, con `uv`, que ya estaba instalado:
+
+```
+~/.claude/pet/.venv/bin/python        # 3.13.15, con PySide6 6.11.2 y pytest
+uv venv --python 3.13 ~/.claude/pet/.venv
+uv pip install --python ~/.claude/pet/.venv PySide6 pytest
+```
+
+El venv vive DENTRO de `~/.claude/pet/` a proposito: el plist de `launchd`
+apunta ahi y no depende de ningun PATH.
+
+**`~/.claude/.credentials.json` no existe en Mac.** El token esta en el
+Keychain (`Claude Code-credentials`). Si `_creds()` empieza a fallar, el
+diagnostico es:
+
+```bash
+security find-generic-password -s "Claude Code-credentials"   # sin -w: metadata, no el secreto
+```
+
+Con `-w` imprime el JSON del token — util para debuggear, pero es un secreto:
+no lo pegues en logs ni en el repo. Si aparece el dialogo de autorizacion,
+"Permitir siempre", o bajo `launchd` no hay nadie que lo conteste.
+
+**El diagnostico de notificaciones es otro.** El `Get-ItemProperty
+HKCU:\...\PushNotifications` de mas abajo es de Windows. En Mac, si no llega
+un aviso:
+
+```bash
+osascript -e 'display notification "test" with title "Claude Code"'; echo $?
+```
+
+Exit 0 y sin notificacion visible = falta el permiso en Ajustes del Sistema ->
+Notificaciones. Y ojo: `tray.showMessage()` NO es una via valida de
+diagnostico en Mac, porque no funciona nunca (ver PORTING.md).
+
+**Un señuelo para probar el corte no puede ser un `cp` de un binario del
+sistema.** Copiar `/bin/sleep` a un archivo llamado `claude` rompe su firma de
+codigo y macOS lo mata al arrancar — el proceso muere antes de que `ps` lo
+vea, y parece que el filtro fallo. Lo que si funciona es un hardlink al python
+de `uv` con `PYTHONHOME` apuntado a su prefix:
+
+```bash
+PYHOME=~/.local/share/uv/python/cpython-3.13.15-macos-aarch64-none
+ln -f $PYHOME/bin/python3.13 /tmp/decoy/claude
+PYTHONHOME=$PYHOME /tmp/decoy/claude -c "import time; time.sleep(300)" &
+```
+
+**Para auditar el corte sin matar nada** esta `_pids_darwin()`, separada de
+`_kill_darwin()` justamente para eso:
+
+```bash
+~/.claude/pet/.venv/bin/python -c "import claude_pet; print(claude_pet._pids_darwin())"
+```
+
+Cuidado al probar el corte de verdad: en esta Mac el filtro incluye las
+sesiones de terminal, o sea **la sesion desde la que estas trabajando**.
+
+### Windows
+
 **El `python` del PATH es el stub de Microsoft Store y no funciona.** Siempre:
 
 ```
@@ -85,8 +150,9 @@ Ningún test toca `~/.claude/pet/` real ni pega contra la API.
 El código vive en dos lugares y se mantienen a mano:
 
 ```
-d:\OneDrive\Documentos\CLAUDE PET\     ← se edita acá
-~/.claude/pet/                          ← es lo que corre
+d:\OneDrive\Documentos\CLAUDE PET\     ← se edita acá   (Windows)
+~/claude-pet/                           ← se edita acá   (Mac, clon de git)
+~/.claude/pet/                          ← es lo que corre (ambas)
 ```
 
 La suite de pytest es la red de seguridad más rápida, y la copia instalada
@@ -184,14 +250,58 @@ verdad, el cruce real de 96% no avisa después. Restaurá `fired.json` desde
 backup y reiniciá al terminar, para soltar las claves de prueba que quedan en
 memoria del proceso.
 
-## Sonido: tonos propios, no el beep de Windows
+## Sonido: tonos propios, no el beep genérico
 
-`_play_alert()` en `claude_pet.py` usa `winsound.Beep()` con dos patrones
-(`ALERT_TONES`) en vez del beep genérico de `QApplication.beep()`: dos notas
-subiendo para aviso, sirena alternada x3 para alarma. Corre en un hilo daemon
-porque `winsound.Beep()` es sincrónico y bloquearía el tick de 1s de Qt.
-`winsound` es exclusivo de Windows (`HAS_WINSOUND`); sin él cae al beep de Qt
-repetido, mismo patrón de conteo que había antes de este cambio.
+`_play_alert()` en `claude_pet.py` evita `QApplication.beep()` en las dos
+plataformas soportadas, porque con el beep genérico aviso y alarma **suenan
+igual** y solo se distinguen contando beeps — que es justamente la
+información que se necesita a las apuradas.
+
+- **Windows**: `winsound.Beep()` con dos patrones (`ALERT_TONES`), dos notas
+  subiendo para aviso, sirena alternada x3 para alarma.
+- **macOS** (25/8/2026): no hay equivalente a `winsound.Beep(freq, ms)` en la
+  stdlib, así que va `afplay` sobre los `.aiff` del sistema (`MAC_SOUNDS`):
+  Tink+Glass para aviso, Funk↔Basso x2 para alarma. Sin dependencias nuevas.
+  **Elegir por timbre, no por volumen**: el primer intento fue Ping+Glass /
+  Sosumi x3 y hubo que cambiarlo porque los tres son campanitas agudas y no se
+  distinguía aviso de alarma sin mirar la pantalla.
+- **Linux y último recurso**: el beep de Qt repetido, mismo patrón de conteo
+  que había antes de este cambio.
+
+Corre en un hilo daemon porque **las dos** APIs son sincrónicas
+(`winsound.Beep()` y `afplay` por igual) y bloquearían el tick de 1s de Qt.
+
+## La animación se pausa por debajo del 50% (26/8)
+
+`_sync_anim()` apaga el timer de 50ms cuando `mood == "calm"`, y lo prende de
+vuelta en cualquier otro estado o durante un flash. Se llama desde `tick()` y
+desde `_fire()` (este último para que el flash arranque al instante y no
+espere hasta un segundo).
+
+**El motivo principal no es la batería, es el jitter.** `_animate` solo llama
+a `update()` en alarm/credit/flash, así que en calm el único repintado era el
+del tick de 1s — y para entonces `pulse` ya había avanzado 20 pasos
+(`0.12 * 20 = 2.4 rad`, ~137°). O sea que el logo pegaba un saltito de tamaño
+por segundo, al azar, en vez de respirar. Al pausar se fija `pulse = 0.0`
+(`sin(0) = 0` → `breathe = 1.0`, el tamaño de reposo) y se hace un último
+`update()`.
+
+**El ahorro de CPU es real pero chico**, medido sobre 20s aislando el timer:
+
+| | corriendo | pausado |
+|---|---|---|
+| despertadas | 407 | 0 |
+| CPU | 0.202s | 0.148s (−27%) |
+| context switches | 433 | 227 (−48%) |
+| % de un core | 0.99% | 0.75% |
+
+O sea ~0.24 puntos de un core. No se nota en la batería; no vender esto como
+si se notara.
+
+**Por qué solo calm y no también watch/warn**, que tampoco dibujan: decisión
+explícita del 26/8 — del 50% para arriba se prefiere no tocar nada. El
+`_anim_en_pausa()` está escrito para que ampliar el criterio sea cambiar una
+condición, si algún día se quiere.
 
 ## AlertScreen: pantalla completa en alarmas (25/8), verificada en vivo
 
@@ -224,6 +334,14 @@ resto de las alertas (`rl_ts = now`, `resets_at` lejos de `WINDOW_MATCH`):
 apareció en el monitor correcto, con el texto legible, y cerró bien con clic.
 
 ## Corte automático: mata procesos de verdad (25/8), verificado con señuelo
+
+> **macOS (25/8/2026)**: todo lo de abajo describe la rama de Windows, que
+> ahora vive en `_kill_win32()`. La rama de Mac es `_kill_darwin()` y usa un
+> filtro **distinto por un motivo de fondo**: en Windows el nombre de proceso
+> es ambiguo (`claude.exe` lo comparte la app de escritorio) y hay que
+> desempatar por ruta; en Mac pasa lo contrario — el nombre alcanza
+> (`Claude` != `claude`), pero la ruta NO sirve, porque el CLI nativo sale
+> pelado en `ps`. Ver `PORTING.md`.
 
 `_kill_claude_code_processes()` (`claude_pet.py`, cerca de `_play_alert`) mata
 los procesos de Claude Code al cruzar `kill_threshold` (95% default,

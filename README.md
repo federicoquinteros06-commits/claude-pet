@@ -11,7 +11,7 @@ sesiones de Claude Code en 95%+ — con notificacion nativa del SO y sonido.
 [ collector ]  statusLine de Claude Code, corre local, 0 tokens
       |        escribe ~/.claude/pet/sessions/<id>.json  <- solo en la TUI
       v
-[ mascota ]    PySide6, lee cada 1s, dibuja, dispara toast + tono
+[ mascota ]    PySide6, lee cada 1s, dibuja, dispara notificacion + tono
 ```
 
 Las dos fuentes reportan las mismas ventanas y la mascota se queda con la mas
@@ -20,11 +20,11 @@ panel de VS Code** (el webview no tiene donde ejecutarlo), asi que si trabajas
 desde el panel el poller es lo unico que tenes. El collector sigue siendo el
 unico que aporta contexto% y costo por sesion.
 
-> **Este proyecto es Windows-only hoy.** Se desarrollo y probo enteramente en
-> Windows; el sonido, la pantalla completa y sobre todo el corte automatico de
-> sesiones usan APIs de Windows sin fallback multiplataforma. Si queres correrlo
-> en macOS o Linux, ver [PORTING.md](PORTING.md) — un analisis de que habria
-> que cambiar, no una implementacion lista.
+> **Windows y macOS.** Se desarrollo en Windows y se porto a macOS el
+> 25/8/2026, verificando cada pieza contra un Mac real (macOS 26.6.2, arm64):
+> credenciales, corte automatico, sonido, notificaciones e instancia unica.
+> Linux sigue sin portar — el corte automatico ahi es un no-op. Ver
+> [PORTING.md](PORTING.md) para el detalle de que cambio y por que.
 
 ---
 
@@ -59,6 +59,17 @@ cp claude_pet_collector.py claude_pet.py claude_pet_usage.py ~/.claude/pet/
 
 `claude_pet_slack.py`, `slack_setup.py` y `slack_app_manifest.yaml` no hacen
 falta para este paso — quedan en el repo como referencia (ver seccion 3).
+
+**macOS**: si el `python3` del sistema es viejo (en macOS 26 es 3.9.6, de
+CommandLineTools) conviene un venv aparte antes que instalar PySide6 encima:
+
+```bash
+uv venv --python 3.13 ~/.claude/pet/.venv
+uv pip install --python ~/.claude/pet/.venv PySide6
+mkdir -p ~/.claude/pet
+cp claude_pet_collector.py claude_pet.py claude_pet_usage.py ~/.claude/pet/
+~/.claude/pet/.venv/bin/python ~/.claude/pet/claude_pet.py
+```
 
 ## 2. Enganchar el collector como statusLine
 
@@ -101,8 +112,9 @@ Quedo funcionando de punta a punta: se creo la app, se instalo, y una alerta
 real llego al DM. Se desactivo despues por dos razones, no porque algo fallara:
 
 1. **El pedido real era otro.** "Push del sistema" resulto significar
-   notificacion en la misma maquina donde corre la mascota — eso es el toast de
-   Windows (seccion de abajo), no algo que necesite salir a internet.
+   notificacion en la misma maquina donde corre la mascota — eso es la
+   notificacion nativa del SO (toast en Windows, centro de notificaciones en
+   macOS), no algo que necesite salir a internet.
 2. **En un Slack corporativo, Slack trae friccion que no vale la pena.**
    *Create New App* suele requerir permiso de admin, y aunque lo tengas, la app
    queda listada en "Agentes y aplicaciones" para cualquiera del workspace que
@@ -149,10 +161,117 @@ Arrastrala con el mouse (guarda la posicion). Click derecho en el icono de
 bandeja: silenciar, abrir config, salir.
 
 Para que arranque sola:
-- **macOS**: `launchd` (`~/Library/LaunchAgents/claude-pet.plist`, `RunAtLoad`)
 - **Windows**: acceso directo a `pythonw claude_pet.py` en `shell:startup`
   (`pythonw` evita la ventana de consola)
 - **Linux**: `.desktop` en `~/.config/autostart/`
+- **macOS**: `launchd`. Guardar como
+  `~/Library/LaunchAgents/com.claudepet.overlay.plist` y cargar con
+  `launchctl load -w ~/Library/LaunchAgents/com.claudepet.overlay.plist`:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+    <key>Label</key><string>com.claudepet.overlay</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/TUUSUARIO/.claude/pet/.venv/bin/python</string>
+      <string>/Users/TUUSUARIO/.claude/pet/claude_pet.py</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+  </dict>
+  </plist>
+  ```
+
+  `launchd` no expande `~`: las rutas van absolutas. Y ojo con el Keychain —
+  si nunca le diste "Permitir siempre" desde una corrida manual, bajo
+  `launchd` no hay nadie para autorizar el dialogo.
+
+---
+
+## macOS: notas de plataforma
+
+El resto del README aplica igual en las dos plataformas — las secciones de
+umbrales, alarma, corte y config explican los dos mundos. Aca queda solo lo
+que es especifico de macOS y no tiene equivalente en Windows.
+
+Portado y verificado el 25/8/2026 contra macOS 26.6.2 (arm64).
+
+**Las credenciales no estan en un archivo, estan en el Keychain.** En Windows
+y Linux el token OAuth vive en `~/.claude/.credentials.json`. En Mac ese
+archivo **no existe**: Claude Code guarda el mismo JSON en el Keychain del
+login, bajo el servicio `Claude Code-credentials`. `_creds()` en
+`claude_pet_usage.py` lo lee con `security find-generic-password -w`.
+
+Era el unico bloqueante real del port, y el mas silencioso: sin ese cambio
+`_token()` tira `FileNotFoundError` en cada poll, `usage.json` nunca se
+escribe, la mascota muestra `--` para siempre y **ningun umbral llega a
+dispararse** — el corte automatico incluido. Se ve igual que "todavia no
+llegaste al 25%".
+
+Si la primera lectura abre el dialogo del Keychain, dale **"Permitir
+siempre"**: bajo `launchd` no hay nadie para autorizarlo y el poller queda
+sin token.
+
+**El corte automatico alcanza tambien a las sesiones de terminal**, no solo al
+panel de VS Code — el porque esta en
+[Corte automatico](#corte-automatico-mata-las-sesiones-de-claude-code-al-95),
+junto al caso de Windows. Para auditar el filtro sin matar nada:
+
+```bash
+~/.claude/pet/.venv/bin/python -c "import claude_pet; print(claude_pet._pids_darwin())"
+```
+
+**Las notificaciones no salen por Qt.** `QSystemTrayIcon.showMessage()` en Mac
+pasa por `UNUserNotificationCenter`, que exige bundle identifier. Corriendo
+como `python claude_pet.py` no hay bundle (`lsappinfo` lo confirma:
+`bundleID=[ NULL ]`) y la notificacion **falla en silencio** — el peor modo de
+fallar para un canal de alerta. Por eso `_notify()` usa `osascript` en darwin.
+La primera vez puede pedir permiso en Ajustes del Sistema -> Notificaciones.
+
+**El sonido usa `afplay`** sobre los `.aiff` del sistema, porque no hay
+equivalente a `winsound.Beep(freq, ms)` en la stdlib. La tabla de tonos de las
+tres plataformas esta en
+[Detalles de implementacion](#detalles-de-implementacion-que-importan).
+
+**La instancia unica necesitaba un fix.** El comentario original decia que en
+Windows el SO libera el bloque de `QSharedMemory` al morir el proceso, asi que
+un crash no deja lock huerfano. En POSIX **no es asi**: el segmento sobrevive
+y `create()` fallaria para siempre — la mascota no volveria a arrancar nunca
+sin borrarlo a mano. `_single_instance_guard()` hace el `attach()`+`detach()`
+que es el remedio estandar de Qt en Unix.
+
+**Sin icono en el Dock.** `_hide_dock_icon()` pone
+`NSApplicationActivationPolicyAccessory` (el `LSUIElement` de un bundle) por
+el runtime de ObjC via `ctypes`, sin arrastrar PyObjC. Es cosmetico: si falla,
+queda el icono y nada mas.
+
+**La mascota desaparecia de la pantalla, y eran dos bugs.** El sintoma era
+"aparece a veces y despues no la veo mas". Medido sobre la ventana real:
+
+| | antes | despues |
+|---|---|---|
+| `hidesOnDeactivate` | `True` | `False` |
+| `collectionBehavior` | `258` (MoveToActiveSpace) | `257` (CanJoinAllSpaces + FullScreenAuxiliary) |
+| `level` | `8` | `25` (NSStatusWindowLevel) |
+
+1. **`Qt.Tool` se traduce a un NSPanel con `hidesOnDeactivate=YES`.** La
+   ventana se esconde sola cuando la app no es la activa — y la mascota
+   **nunca** es la activa, que es justamente el punto de usar `Qt.Tool` (no
+   robar foco). O sea que se ocultaba apenas tocabas cualquier otra ventana.
+
+2. **La ventana no cruzaba de Space.** El `258` era
+   `MoveToActiveSpace | FullScreenAuxiliary`: MoveToActiveSpace mueve la
+   ventana al Space activo *cuando la app se activa*, y esta app no se activa
+   nunca. Se quedaba donde nacio. Ademas el nivel 8 queda **por debajo** de
+   una app en pantalla completa.
+
+`_mac_keep_visible()` arregla los dos, y se aplica tambien a `AlertScreen`:
+ahi importa mas todavia, porque la pantalla completa es el unico canal que no
+se corta con `muted` — el respaldo para cuando no estas mirando la mascota.
 
 ---
 
@@ -210,12 +329,18 @@ sonido o toast ahi no aporta nada, así que se apagan a proposito.
 
 ## Alarma en pantalla completa
 
-En 90% (`alarm_thresholds`), ademas del toast y el sonido, se abre una
-pantalla completa en tu **monitor principal** — el mismo que Windows llama
-"Pantalla principal" en Configuracion -> Sistema -> Pantalla, sin importar en
-cual de tus monitores este la mascota. Pensada para cuando las notificaciones
-estan muteadas, no tenes los auriculares puestos, o estas mirando otro
-monitor: es el unico canal que no depende de verla ni de escucharla a tiempo.
+En 90% (`alarm_thresholds`), ademas de la notificacion y el sonido, se abre
+una pantalla completa en tu **monitor principal**, sin importar en cual de tus
+monitores este la mascota. Es el que cada SO designa como principal:
+
+| | donde se define |
+|---|---|
+| Windows | Configuracion -> Sistema -> Pantalla -> "Pantalla principal" |
+| macOS | Ajustes del Sistema -> Pantallas -> la que tiene la barra de menus |
+
+Pensada para cuando las notificaciones estan muteadas, no tenes los
+auriculares puestos, o estas mirando otro monitor: es el unico canal que no
+depende de verla ni de escucharla a tiempo.
 
 Por eso **no se corta con `muted`**: es a proposito, es el respaldo para
 cuando el resto esta silenciado. Se cierra con un clic, cualquier tecla, o
@@ -242,20 +367,41 @@ ventana de 5h, la mascota:
    notificacion del SO** — a esta altura ya sonaron cinco avisos antes (25,
    50, 75, 85, 90%); la unica alerta que falta es la que corta de verdad.
 
-**Que NO toca.** Solo el proceso `claude.exe` del agente — el que
+**Que NO toca.** Solo el proceso del agente de Claude Code — el que
 efectivamente consume la ventana de 5h. VS Code, la terminal que lo lanzo, y
 la app de escritorio de Claude siguen abiertos: la ventana/pestaña donde
 estaba esa sesion va a mostrar que se desconecto, pero el resto del programa
 sigue andando. No cierra editores, no pierde el resto de tu trabajo.
 
-**Por que no basta con matar por nombre de proceso.** `claude.exe` es
-ambiguo: la app de escritorio de Claude usa el MISMO nombre de ejecutable
-(`...\WindowsApps\Claude_...\app\claude.exe`) para un producto que no tiene
-nada que ver con la ventana de 5h. Filtrar por nombre a secas mataria esa app
-tambien. El filtro real usa la ruta especifica del binario nativo que trae la
-extension de VS Code
-(`.../extensions/anthropic.claude-code-*/resources/native-binary/claude.exe`),
-verificado contra los procesos reales de esta maquina.
+**Identificar ese proceso es el problema dificil, y es distinto en cada SO.**
+En los dos casos hace falta un filtro preciso, pero por motivos opuestos:
+
+| | el CLI se ve como | la app de escritorio se ve como | el riesgo |
+|---|---|---|---|
+| **Windows** | `claude.exe` | `claude.exe` | el nombre es **ambiguo**: filtrar por nombre mataria la app de escritorio |
+| **macOS** | `.../native-binary/claude` (panel de VS Code) o `claude` a secas (CLI nativo) | `Claude`, `Claude Helper (...)` | el nombre alcanza, pero la **ruta no siempre esta**: filtrar por ruta dejaria viva la sesion de terminal |
+
+- **Windows** desempata por ruta: usa el segmento especifico del binario
+  nativo que trae la extension de VS Code
+  (`.../extensions/anthropic.claude-code-*/resources/native-binary/claude.exe`),
+  porque la app de escritorio comparte el nombre de ejecutable
+  (`...\WindowsApps\Claude_...\app\claude.exe`) para un producto que no tiene
+  nada que ver con la ventana de 5h.
+
+- **macOS** compara el **basename, case-sensitive**, contra `claude`. Ahi el
+  nombre no es ambiguo (`Claude` != `claude`), asi que la app de escritorio y
+  sus helpers quedan afuera solos. Y tiene que ser por basename y no por ruta,
+  porque el CLI nativo (`~/.local/bin/claude`) es un symlink que `ps` no
+  resuelve: sale pelado, sin ruta. Un filtro por ruta cubriria el panel de
+  VS Code pero dejaria viva cada sesion de terminal, que quema la ventana de
+  5h exactamente igual.
+
+Los dos filtros estan verificados contra los procesos reales de sus maquinas.
+En macOS podes auditar el tuyo sin matar nada:
+
+```bash
+python3 -c "import claude_pet; print(claude_pet._pids_darwin())"
+```
 
 **Solo alcanza a esta maquina.** Si usas Claude Code desde otra computadora,
 o via un agente en la nube, el corte automatico no llega ahi — protege
@@ -268,10 +414,24 @@ Para apagarlo, `auto_kill_enabled: false`.
 
 ## Detalles de implementacion que importan
 
-**El sonido corre en un hilo aparte.** `winsound.Beep()` es sincronico: llamarlo
-en el hilo de Qt bloquearia el tick de 1s y la animacion de 50ms mientras dura
-la secuencia (hasta ~700ms en la alarma). `_play_alert()` lo tira en un hilo
-daemon; sin winsound (mac/Linux) cae al beep generico de Qt.
+**El sonido corre en un hilo aparte.** Las dos APIs nativas son sincronicas
+—`winsound.Beep()` en Windows y `afplay` en macOS— asi que llamarlas en el hilo
+de Qt bloquearia el tick de 1s y la animacion mientras dura la secuencia (hasta
+~700ms en la alarma). `_play_alert()` las tira en un hilo daemon.
+
+**Y en los dos casos el tono es propio, no el beep del sistema.** Con el beep
+generico de Qt, aviso y alarma **suenan igual** y solo se distinguen contando
+beeps — justo la informacion que necesitas sin mirar la pantalla:
+
+| | aviso | alarma |
+|---|---|---|
+| Windows | `winsound.Beep`, dos notas subiendo (988 -> 1319 Hz) | sirena alternada (1568 <-> 1175 Hz) x3 |
+| macOS | `afplay`: Tink -> Glass | Funk <-> Basso, x2 |
+| Linux | beep de Qt x1 | beep de Qt x3 |
+
+En macOS la eleccion es por **timbre**, no por volumen: el primer intento
+(Ping+Glass / Sosumi) hubo que descartarlo porque los tres son campanitas
+agudas y el problema seguia intacto.
 
 **Por que el collector no hace HTTP.** El statusLine bloquea la actualizacion de
 la barra mientras corre, y si llega un update nuevo mientras el script sigue
@@ -368,5 +528,7 @@ esta dimensionado para eso, no para monitoreo.
   fino (no interrumpe una escritura en curso), a costo de mas superficie de
   implementacion y de no cubrir una sesion ya bloqueada esperando una
   respuesta larga del modelo.
-- Portar el corte automatico y la pantalla completa a macOS/Linux (ver
-  `PORTING.md`): hoy son Windows-only.
+- ~~Portar el corte automatico y la pantalla completa a macOS/Linux.~~
+  **macOS hecho** (25/8/2026, ver `PORTING.md` y la seccion de macOS arriba).
+  Linux sigue pendiente: necesita la misma rama `ps`/`os.kill` que darwin,
+  pero con su propia verificacion de como se ve el CLI en `ps` ahi.

@@ -24,6 +24,8 @@ statusLine queda como fallback. No lo borres.
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -34,6 +36,12 @@ from pathlib import Path
 PET_DIR = Path.home() / ".claude" / "pet"
 USAGE_PATH = PET_DIR / "usage.json"
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+# En macOS el archivo de credenciales NO EXISTE: Claude Code guarda el mismo
+# JSON en el Keychain del login, bajo este servicio. Verificado el 25/8/2026
+# contra un Mac real (macOS 26.6.2) donde ~/.claude/ tiene 20 entradas y
+# ninguna es .credentials.json. Ver _creds().
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 # usage.json se considera vigente si se escribio hace menos que esto. Con un
@@ -118,11 +126,45 @@ def _window(w):
     return {"used_percentage": int(round(util)), "resets_at": _epoch(w.get("resets_at"))}
 
 
+def _creds() -> dict:
+    """El JSON de credenciales, venga de donde venga segun la plataforma.
+
+    En Windows y Linux vive en ~/.claude/.credentials.json. En macOS ese
+    archivo NO EXISTE — Claude Code guarda el mismo JSON en el Keychain del
+    login. Es el unico bloqueante real del port: sin esto _token() tira
+    FileNotFoundError en cada poll, usage.json nunca se escribe, la mascota
+    muestra "--" para siempre y NINGUN umbral llega a dispararse (ni el corte
+    automatico). PORTING.md daba por sentado que la ruta era la misma en Mac;
+    verificado el 25/8/2026, no lo es.
+
+    Se chequea el archivo PRIMERO, no `sys.platform`: si algun dia Claude Code
+    vuelve al archivo en Mac, esto sigue andando sin tocar nada.
+    """
+    if CREDS_PATH.exists():
+        return json.loads(CREDS_PATH.read_text(encoding="utf-8"))
+
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"keychain: {e}") from e
+        if r.returncode != 0:
+            # 44 = no existe esa entrada (no logueado con Claude Code);
+            # 128 = el usuario cancelo el dialogo de autorizacion.
+            raise RuntimeError(
+                f"keychain ({KEYCHAIN_SERVICE}): "
+                f"{r.stderr.strip() or f'exit {r.returncode}'}")
+        return json.loads(r.stdout)
+
+    raise FileNotFoundError(CREDS_PATH)
+
+
 def _token():
     """Se re-lee en cada poll a proposito: Claude Code refresca el token solo,
     y si lo cachearamos nos quedariamos con uno vencido."""
-    d = json.loads(CREDS_PATH.read_text(encoding="utf-8"))
-    return d["claudeAiOauth"]["accessToken"]
+    return _creds()["claudeAiOauth"]["accessToken"]
 
 
 def fetch_usage(timeout=20) -> dict:

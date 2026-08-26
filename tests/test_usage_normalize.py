@@ -144,3 +144,90 @@ def test_poll_once_escribe_atomico(endpoint, tmp_path, monkeypatch):
     escrito = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
     assert escrito["five_hour"]["used_percentage"] == 40
     assert not list(tmp_path.glob("*.tmp"))   # el tmp se renombro, no quedo basura
+
+
+# ------------------------------------------------------- credenciales
+#
+# En macOS ~/.claude/.credentials.json NO EXISTE: el token vive en el Keychain.
+# Es el unico bloqueante real del port — sin esto _token() tira
+# FileNotFoundError en cada poll y la mascota nunca recibe un dato.
+
+CREDS_JSON = '{"claudeAiOauth": {"accessToken": "sk-ant-oat-XXX"}}'
+
+
+class FakeSecurity:
+    def __init__(self, stdout=CREDS_JSON, returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_mac_lee_el_token_del_keychain(tmp_path, monkeypatch):
+    visto = {}
+
+    def fake_run(cmd, **kwargs):
+        visto["cmd"] = cmd
+        return FakeSecurity()
+
+    monkeypatch.setattr(usage, "CREDS_PATH", tmp_path / "no-existe.json")
+    monkeypatch.setattr(usage.sys, "platform", "darwin")
+    monkeypatch.setattr(usage.subprocess, "run", fake_run)
+
+    assert usage._token() == "sk-ant-oat-XXX"
+    assert visto["cmd"][:2] == ["security", "find-generic-password"]
+    assert usage.KEYCHAIN_SERVICE in visto["cmd"]
+    assert "-w" in visto["cmd"]  # sin -w devuelve metadata, no el secreto
+
+
+def test_el_archivo_gana_si_existe(tmp_path, monkeypatch):
+    """Se chequea el archivo primero, no sys.platform: si Claude Code volviera
+    al archivo en Mac, esto sigue andando sin tocar codigo."""
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"claudeAiOauth": {"accessToken": "del-archivo"}}',
+                     encoding="utf-8")
+
+    llamado = []
+    monkeypatch.setattr(usage, "CREDS_PATH", creds)
+    monkeypatch.setattr(usage.sys, "platform", "darwin")
+    monkeypatch.setattr(usage.subprocess, "run",
+                        lambda *a, **k: llamado.append(1))
+
+    assert usage._token() == "del-archivo"
+    assert llamado == []  # no se molesto al Keychain
+
+
+def test_keychain_sin_entrada_explica_el_motivo(tmp_path, monkeypatch):
+    """El poller se traga las excepciones pero deja LAST_ERROR: el mensaje
+    tiene que servir para diagnosticar, no ser un exit code pelado."""
+    monkeypatch.setattr(usage, "CREDS_PATH", tmp_path / "no-existe.json")
+    monkeypatch.setattr(usage.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        usage.subprocess, "run",
+        lambda *a, **k: FakeSecurity(
+            "", returncode=44, stderr="SecKeychainSearchCopyNext: no encontrado"))
+
+    with pytest.raises(RuntimeError, match="keychain"):
+        usage._token()
+
+
+def test_keychain_cancelado_no_cuelga(tmp_path, monkeypatch):
+    """Si el usuario cancela el dialogo o `security` no esta, es un error
+    normal del poll, no un crash de la mascota."""
+    monkeypatch.setattr(usage, "CREDS_PATH", tmp_path / "no-existe.json")
+    monkeypatch.setattr(usage.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        usage.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+
+    with pytest.raises(RuntimeError):
+        usage._token()
+
+
+def test_windows_sin_archivo_sigue_siendo_filenotfound(tmp_path, monkeypatch):
+    """La rama del Keychain es solo de darwin: en Windows el error tiene que
+    seguir siendo el de siempre."""
+    monkeypatch.setattr(usage, "CREDS_PATH", tmp_path / "no-existe.json")
+    monkeypatch.setattr(usage.sys, "platform", "win32")
+
+    with pytest.raises(FileNotFoundError):
+        usage._token()

@@ -1,154 +1,189 @@
-# Portar a macOS (y notas de Linux) — análisis, no implementación
+# Portar a macOS — hecho y verificado (y notas de Linux)
 
-Este documento existe porque **Claude Pet se desarrolló y se probó enteramente
-en Windows**, y hoy tiene piezas centrales (sonido, la pantalla completa de
-alarma, y sobre todo el corte automático de sesiones) atadas a APIs de
-Windows. Nada de esto se portó todavía — es un mapa de qué tocaría cambiar si
-alguien (yo mismo, en mi Mac de trabajo) quisiera correrlo ahí. No se probó
-nada de lo que sigue contra un Mac real: son inferencias sobre PySide6, la
-librería estándar de Python, y cómo está estructurado el resto del código, no
-verificaciones en vivo como las que respaldan el resto de este repo.
+Este documento existia como **analisis previo**: Claude Pet se desarrollo y
+probo enteramente en Windows, y lo que seguia era un mapa de que habria que
+cambiar, explicitamente sin verificar ("son inferencias sobre PySide6, la
+libreria estandar de Python, y como esta estructurado el resto del codigo, no
+verificaciones en vivo").
 
-## Resumen: qué anda tal cual, qué no anda, qué falta escribir
+**El port a macOS se hizo el 25/8/2026** contra un Mac real (macOS 26.6.2,
+arm64, Apple Silicon). Este documento pasa a ser el registro de que resulto
+cierto y que no. Linux sigue sin portar.
 
-| Pieza | En macOS | Por qué |
+## Lo primero: donde el analisis previo se equivoco
+
+Dos de los cuatro supuestos centrales no sobrevivieron al contacto con la
+maquina, y el que fallo peor era justamente el que estaba marcado como
+"deberia andar tal cual".
+
+### ❌ El poller NO andaba tal cual — este era el bloqueante real
+
+El analisis decia: *"`claude_pet_usage.py` (poller): **Anda tal cual,
+asumiendo**. Asume que `~/.claude/.credentials.json` vive en la misma ruta
+relativa en Mac — no verificado."*
+
+En Mac ese archivo **no existe**. Claude Code guarda el mismo JSON en el
+Keychain del login (servicio `Claude Code-credentials`). Verificado listando
+`~/.claude/`: 20 entradas, ninguna es `.credentials.json`.
+
+Es el fallo mas caro de los dos, porque es **silencioso**: `_token()` tira
+`FileNotFoundError` en cada poll, se lo traga el `try/except` del poller,
+`usage.json` nunca se escribe, y la mascota muestra `--`. No parece un error:
+parece que todavia no llegaste a ningun umbral. Ninguna alerta, ninguna
+alarma, ningun corte automatico — nunca. Todo el resto del port (matar
+procesos, sonar, notificar) cuelga de que este dato exista.
+
+Fix: `_creds()` en `claude_pet_usage.py`, con `security find-generic-password
+-s "Claude Code-credentials" -w`. Chequea el archivo **primero** y cae al
+Keychain despues, no al reves: si algun dia Claude Code vuelve al archivo en
+Mac, sigue andando sin tocar codigo.
+
+### ❌ El filtro del corte por ruta era incompleto
+
+El analisis planteaba portar el filtro de Windows (marcador de ruta del
+binario de la extension de VS Code) tal cual, sin `.exe`. La ruta se confirmo
+—  `~/.vscode/extensions/anthropic.claude-code-2.1.241-darwin-arm64/resources/
+native-binary/claude`, misma estructura — pero el filtro igual quedaba corto.
+
+Lo que el analisis no contemplo: en Mac hay **dos formas** de correr Claude
+Code a la vez, y solo una se ve por ruta. Medido sobre los procesos reales:
+
+```
+7 procesos  .../native-binary/claude   <- panel de VS Code
+1 proceso   claude                      <- CLI nativo, desde terminal
+```
+
+El CLI nativo (`~/.local/bin/claude` -> `~/.local/share/claude/versions/X`)
+sale **pelado** en `ps -axo comm=`: es un symlink y `ps` no lo resuelve. Un
+filtro por marcador de ruta habria matado los 7 del panel y dejado viva la
+sesion de terminal, que quema la ventana de 5h exactamente igual.
+
+Fix: comparar `os.path.basename(comm)` con `"claude"`, case-sensitive.
+
+## Lo que el analisis previo acerto
+
+### ✅ La ambiguedad de nombre de Windows no se repite
+
+Era una suposicion ("basada en como empaquetan Electron normalmente en Mac, no
+algo confirmado contra el `Info.plist` real"). Confirmada:
+
+```
+/Applications/Claude.app/Contents/MacOS/Claude                    <- 'Claude'
+.../Claude Helper (Renderer).app/Contents/MacOS/Claude Helper...  <- 'Claude Helper'
+.../ClaudeUsageWidgetExtension.appex/.../ClaudeUsageWidgetExtension
+```
+
+Ninguno es `claude` exacto, asi que el match case-sensitive por basename los
+excluye a los tres **solo**. No hizo falta nada parecido al `-Filter "Name =
+'claude.exe'"` que en Windows evita que la consulta se automatchee: `ps` no
+inyecta el patron de busqueda en su propia linea de comandos.
+
+Verificado en vivo: el filtro devuelve 8 objetivos y deja los 10 procesos de
+`Claude.app` intactos.
+
+### ✅ Overlay, tray, colores, barra
+
+Andan por Qt sin un solo cambio, como se esperaba.
+
+### ✅ `QSharedMemory` tenia el gotcha POSIX que se sospechaba
+
+*"En sistemas POSIX los segmentos de memoria compartida historicamente pueden
+sobrevivir a un crash sin liberarse solos."* Correcto, y se arreglo con el
+`attach()`+`detach()` estandar de Qt en Unix (`_single_instance_guard()`).
+
+Probado explicitamente, que era lo que el analisis pedia: se lanza la mascota,
+se la mata con `kill -9`, y se relanza. **Arranca.** Antes del fix ese `-9`
+habria dejado el lock tomado para siempre.
+
+## Lo que el analisis no vio venir
+
+### El toast de Qt no degrada: no funciona
+
+El analisis lo daba como *"Deberia andar, permisos distintos"*, esperando que
+la diferencia fuera el modelo de permisos. Es peor que eso.
+`QSystemTrayIcon.showMessage()` en Mac pasa por `UNUserNotificationCenter`,
+que **exige bundle identifier**. Corriendo como `python claude_pet.py` no hay
+bundle — `lsappinfo` lo confirma: `bundleID=[ NULL ]` — y la notificacion no
+aparece.
+
+Y falla **en silencio**, que para un canal de alerta es el peor modo posible
+de fallar: la llamada no tira, no loguea, simplemente no pasa nada. Igual que
+el bug de las credenciales, se veria como "todavia no llego a ningun umbral".
+
+Fix: `_notify()` usa `osascript -e 'display notification ...'` en darwin, que
+no necesita bundle propio. Verificado: notificaciones reales en pantalla.
+
+### El icono del Dock
+
+No estaba en el analisis. PySide6 sin bundle abre icono en el Dock y entra en
+Cmd+Tab, para un overlay que vive en la barra de menu. `_hide_dock_icon()` lo
+resuelve con `NSApplicationActivationPolicyAccessory` (el `LSUIElement` de un
+bundle) por el runtime de ObjC via `ctypes` — sin arrastrar PyObjC, que habria
+sido una dependencia nueva. Verificado: `lsappinfo` reporta `type="UIElement"`.
+
+## Sonido: se hizo el tono propio
+
+El analisis lo daba como degradacion aceptable (`QApplication.beep()`
+repetido) y sugeria `afplay` o PyObjC como mejora opcional. Se hizo con
+`afplay`, porque lo que se perdia no era cosmetico: con el beep generico,
+aviso y alarma **suenan igual** y solo se distinguen contando beeps. Ping+Glass
+para aviso (dos notas), Sosumi x3 para alarma (sirena). Sin dependencias
+nuevas.
+
+## Tabla final
+
+| Pieza | En macOS | Estado |
 |---|---|---|
-| `claude_pet_collector.py` | **Anda tal cual** | Solo stdlib (`json`, `os`, `sys`, `time`, `pathlib`). El fix de `sys.stdout.reconfigure` es un no-op inofensivo fuera de Windows. |
-| `claude_pet_usage.py` (poller) | **Anda tal cual, asumiendo** | Solo `urllib`+stdlib. Asume que `~/.claude/.credentials.json` vive en la misma ruta relativa en Mac — no verificado. |
-| `claude_pet_slack.py` + `slack_setup.py` | **Anda tal cual** | Solo `urllib`. Ya está desconectado de la mascota (ver README sección 3), asi que ni siquiera hace falta para correrla. |
-| Overlay, colores, barra, tray icon | **Debería andar via Qt** | `QSystemTrayIcon`, `QPainter`, `QSvgRenderer` son todos cross-platform. No probado en un Mac real. |
-| Sonido (`_play_alert`) | **Degrada, no rompe** | Cae al beep genérico de Qt (`QApplication.beep()`) en vez de los tonos propios. Pierde el diseño (timbre de 2 notas / sirena) pero no falla. |
-| Toast del SO | **Debería andar, permisos distintos** | `QSystemTrayIcon.showMessage()` es cross-platform, pero el modelo de permisos de macOS es por-app (primer uso pide permiso), no un toggle global como el de Windows. Sin código de diagnóstico para Mac (ver abajo). |
-| Pantalla completa (`AlertScreen`) | **Debería andar, sin verificar** | `QApplication.primaryScreen()` + `showFullScreen()` son cross-platform. Sin probar contra Spaces/Mission Control/notch. |
-| **Corte automático** (`_kill_claude_code_processes`) | **NO ANDA** | 100% Windows: PowerShell + WMI. Sin fallback, sin puerto. En Mac hoy esto es un no-op silencioso (`sys.platform != "win32"` devuelve `-1`). |
-| Instancia única (`QSharedMemory`) | **Riesgo distinto** | Cross-platform en la API, pero el comportamiento ante un crash difiere — ver mas abajo. |
-| Autostart | **Ya documentado** | El README ya trae la receta de `launchd` para macOS. No hace falta escribir nada nuevo. |
+| `claude_pet_collector.py` | Anda tal cual | ✅ verificado |
+| `claude_pet_usage.py` (poller) | **Necesitaba el Keychain** | ✅ portado |
+| `claude_pet_slack.py` + `slack_setup.py` | Anda tal cual (y sigue desconectado) | — |
+| Overlay, colores, barra, tray icon | Anda por Qt | ✅ verificado |
+| Sonido | `afplay` + .aiff del sistema | ✅ portado |
+| Notificacion del SO | **Qt no sirve**, va por `osascript` | ✅ portado |
+| Pantalla completa (`AlertScreen`) | Anda | ⚠️ sin probar contra Spaces |
+| **Corte automatico** | `ps` + basename + `SIGTERM`/`SIGKILL` | ✅ portado |
+| Instancia unica (`QSharedMemory`) | **Necesitaba el fix POSIX** | ✅ portado |
+| Icono en el Dock | `ctypes` + activation policy | ✅ portado |
+| Autostart | `launchd`, receta completa en el README | ✅ |
 
-## Por módulo
+## Lo que sigue sin verificar
 
-### `claude_pet.py` — el núcleo
+**La pantalla completa contra Mission Control / Spaces.** Era el punto 3 de la
+lista de "que haria falta para un port real" y sigue abierto: no se probo si
+`WindowStaysOnTopHint` sobrevive un cambio de Space, ni si el fullscreen tapa
+la barra de menu o el notch. Vale la limitacion que ya documenta el README para
+Windows: una app en fullscreen exclusivo puede tapar cualquier ventana
+always-on-top.
 
-**`winsound` (líneas ~47-51).** Exclusivo de Windows; el import ya falla
-gracioso (`HAS_WINSOUND = False` en cualquier otro `sys.platform`) y
-`_play_alert()` ya tiene el fallback escrito: repite `QApplication.beep()`
-en vez de tocar `ALERT_TONES`. **No hace falta ningún cambio para que ande**,
-pero se pierde el diseño de sonido (timbre de dos notas para aviso, sirena
-para alarma) — se escucha el beep genérico del sistema, sin distinguir aviso
-de alarma más que por la cantidad de beeps. Para recuperar tonos propios en
-Mac: `afplay` sobre un `.aiff`/`.wav` generado al vuelo (no hay equivalente
-directo a `winsound.Beep(freq, ms)` en la stdlib de macOS), o `AppKit.NSSound`
-via PyObjC — una dependencia nueva que hoy el proyecto no tiene.
+## Tests
 
-**`_kill_claude_code_processes()` (el corte automático) — esto es lo que
-realmente falta escribir.** Hoy es PowerShell + `Get-CimInstance Win32_Process`
-+ `Stop-Process -Force`, sin ninguna rama para otro SO. Para portarlo:
+`tests/test_kill.py` tenia un `test_no_windows_no_intenta_nada` parametrizado
+sobre `["darwin", "linux"]` que afirmaba que en Mac no se hacia nada. Dejo de
+ser cierto: `darwin` salio del parametrize (quedo
+`test_linux_todavia_no_esta_portado`) y hay una suite nueva de 11 tests que
+corre la salida REAL de `ps` de esta maquina como fixture, cubriendo que se
+maten las dos formas de correr Claude Code, que **no** se toque la app de
+escritorio, la escalada SIGTERM -> SIGKILL solo para sobrevivientes, y los
+modos de fallo (`ps` ausente, timeout, returncode ≠ 0).
 
-1. **Encontrar el proceso.** En Mac, el equivalente seria `pgrep -f` o iterar
-   `ps aux` buscando el patrón de ruta del binario nativo de la extensión de
-   VS Code. La ruta en Windows es
-   `.../extensions/anthropic.claude-code-*/resources/native-binary/claude.exe`;
-   en Mac casi seguro es la misma estructura sin el `.exe`
-   (`.../native-binary/claude`), pero **no está verificado** — habria que
-   inspeccionar `~/.vscode/extensions/anthropic.claude-code-*/` en un Mac real
-   antes de escribir el filtro.
-2. **El problema del nombre ambiguo, ¿existe en Mac?** En Windows, `claude.exe`
-   lo comparten el CLI de Claude Code y la app de escritorio de Claude (Electron,
-   ~9 procesos). En macOS, la app de escritorio es un `.app` bundle
-   (`/Applications/Claude.app/Contents/MacOS/Claude`, casi seguro, con su
-   propio `CFBundleIdentifier`) — el nombre del proceso probablemente sea
-   distinto del binario CLI (`claude`), lo que significaria que la ambigüedad
-   de Windows **no se repite** en Mac. Pero esto es una suposición basada en
-   cómo empaquetan Electron normalmente en Mac, no algo confirmado contra el
-   `Info.plist` real de la app.
-3. **Matar el proceso.** `os.kill(pid, signal.SIGTERM)` (o `SIGKILL` si hace
-   falta forzar, equivalente a `-Force`) reemplaza a `Stop-Process`. Mucho más
-   simple que el WMI de Windows — sin el problema de "la propia consulta se
-   automatchea" que hubo que resolver en Windows, porque `pgrep`/`ps` no
-   inyectan su propio patrón de búsqueda en su propia línea de comandos de la
-   misma manera que `Get-CimInstance ... -Command <script con el patron>` lo
-   hacía.
-4. **`sys.platform`.** Hoy `_kill_claude_code_processes()` corta en seco con
-   `if sys.platform != "win32": return -1`. Un puerto a Mac necesita una rama
-   `elif sys.platform == "darwin":` con la implementación de arriba, y
-   `tests/test_kill.py` ya tiene los tests parametrizados por plataforma
-   (`test_no_windows_no_intenta_nada`) — esos tests HABRIA que reescribirlos
-   para "darwin" en vez de asumir que ahí no se hace nada.
+`tests/test_usage_normalize.py` suma 5 tests del Keychain: que se lea con
+`-w`, que el archivo gane si existe, que un error explique el motivo, y que en
+Windows el fallo siga siendo `FileNotFoundError`.
 
-**`AlertScreen` (pantalla completa).** Usa solo `QApplication.primaryScreen()`,
-`showFullScreen()`, `Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint` — todo
-API de Qt, no de Windows. Debería andar sin cambios de código. Lo que no está
-probado: cómo se comporta `WindowStaysOnTopHint` contra Mission Control /
-Spaces (¿la ventana se ve si cambiás de Space?), y si el fullscreen tapa la
-barra de menú de macOS o el notch en modelos que lo tienen.
-
-**El toast (`tray.showMessage()`).** También es Qt puro, pero el modelo de
-permisos de macOS es otro: cada app pide permiso de notificaciones la primera
-vez (no hay un toggle global equivalente al `ToastEnabled` de Windows). El
-diagnóstico que documenta [CLAUDE.md](CLAUDE.md) (`Get-ItemProperty
-HKCU:\...\PushNotifications`) es específico de Windows; en Mac el chequeo
-seria via Configuración del Sistema → Notificaciones → Claude Pet, o
-programáticamente con `UNUserNotificationCenter` (PyObjC), que hoy no es una
-dependencia del proyecto.
-
-**`QSharedMemory` (instancia única).** La API es cross-platform, pero el
-comentario en el código documenta explícitamente el supuesto de Windows: *"En
-Windows el bloque de memoria lo libera el SO al morir el proceso, así que un
-crash no deja un lock huérfano."* En sistemas POSIX (Mac y Linux), los
-segmentos de memoria compartida históricamente pueden sobrevivir a un crash
-sin liberarse solos — es un gotcha conocido de `QSharedMemory` en Unix. Si se
-porta, hay que probar explícitamente qué pasa si la mascota crashea en Mac: si
-el guard queda "tomado" para siempre, un reinicio legítimo nunca podría volver
-a levantar la mascota sin borrar el segmento a mano.
-
-### `claude_pet_collector.py`, `claude_pet_usage.py`, `claude_pet_slack.py`, `slack_setup.py`
-
-Ningún cambio de código necesario, con una salvedad: `claude_pet_usage.py`
-asume `~/.claude/.credentials.json` para el token OAuth. Es la misma ruta que
-usa Claude Code en Windows; probablemente sea igual en Mac (Claude Code guarda
-su config bajo `~/.claude/` en las plataformas que soporta), pero esto no se
-confirmó contra una instalación de Mac real.
-
-### Autostart
-
-El README ya trae la receta de macOS (`launchd`,
-`~/Library/LaunchAgents/claude-pet.plist`, `RunAtLoad`) — no hace falta
-escribir nada nuevo ahí, esa parte ya se pensó multi-plataforma desde el
-principio.
-
-### `pythonw.exe` / el shim de `claude`
-
-Toda la sección de "Trampas del entorno" en [CLAUDE.md](CLAUDE.md) (el stub de
-Python de Microsoft Store, el shim `~/bin/claude`) es específica de **esta
-máquina Windows**, no del proyecto — no aplica a Mac y no hace falta portarla.
-En Mac, `python3` del sistema (o de Homebrew) alcanza; no existe el problema
-del stub de la Store.
-
-## Qué haría falta para un port real (orden sugerido)
-
-1. Confirmar en un Mac real la ruta del binario nativo de la extensión de
-   Claude Code (`~/.vscode/extensions/anthropic.claude-code-*/resources/
-   native-binary/`) y si la app de escritorio de Claude comparte nombre de
-   proceso con el CLI (el problema que motivó `CLAUDE_CODE_CLI_MARKER` en
-   Windows). Esto define si `_kill_claude_code_processes` en Mac necesita el
-   mismo cuidado de filtrado o puede ser más simple.
-2. Escribir la rama `darwin` de `_kill_claude_code_processes` (`pgrep`/`ps` +
-   `os.kill`), actualizando `tests/test_kill.py` para cubrirla en vez de solo
-   afirmar que en no-Windows no se hace nada.
-3. Probar `AlertScreen` y el toast contra un Mac real: primer plano sobre
-   Spaces, comportamiento del permiso de notificaciones.
-4. Probar el crash-recovery de `QSharedMemory` en Mac antes de confiar en el
-   mismo comentario que documenta el comportamiento de Windows.
-5. Sonido: decidir si vale la pena el tono propio (via `afplay` o PyObjC) o si
-   el fallback a `QApplication.beep()` alcanza — es una degradación cosmética,
-   no un bloqueante.
+Suite completa: **123 tests**, sin red, corriendo desde el Mac (los tests
+mockean `sys.platform`, asi que la rama de Windows se sigue verificando).
 
 ## Linux, de paso
 
-No fue pedido, pero la mayoría de lo de arriba aplica igual: el corte
-automático necesitaría la misma rama `pgrep`/`os.kill` que macOS (con su
-propia verificación de rutas — la extensión de VS Code en Linux probablemente
-viva bajo `~/.vscode/extensions/` también), el toast pasaría por
-`QSystemTrayIcon` con el backend nativo que exponga el entorno de escritorio
-(GNOME/KDE via D-Bus, con sus propios permisos), y `QSharedMemory` comparte el
-mismo gotcha POSIX que macOS. El README ya documenta autostart para Linux
-(`.desktop` en `~/.config/autostart/`).
+Sigue sin portar: `_kill_claude_code_processes()` devuelve `-1` en linux y
+`test_linux_todavia_no_esta_portado` lo fija. La rama seria muy parecida a la
+de darwin (`ps` + `os.kill`), pero **necesita su propia verificacion**: no
+esta comprobado como se ve el CLI de Claude Code en `ps` ahi, ni si la app de
+escritorio comparte nombre. Justamente el tipo de supuesto que en Mac fallo
+dos de cuatro veces.
+
+`_play_alert` y `_notify` ya caen a `QApplication.beep()` y
+`QSystemTrayIcon.showMessage()` respectivamente en linux, que es lo razonable
+hasta que alguien lo pruebe. El fix POSIX de `QSharedMemory` **si** aplica a
+linux y ya esta puesto (la rama es `!= "win32"`, no `== "darwin"`). El README
+ya documenta autostart con `.desktop` en `~/.config/autostart/`.

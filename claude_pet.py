@@ -38,7 +38,8 @@ POLL_MS = 1000
 # El poller de /api/oauth/usage es opcional: si falta el modulo la mascota
 # sigue andando con lo que reporte el collector del statusLine.
 try:
-    from claude_pet_usage import USAGE_PATH, USAGE_FRESH, STATE_PATH, start_poller
+    from claude_pet_usage import (USAGE_PATH, USAGE_FRESH, STATE_PATH,
+                                   start_poller, get_last_usage)
     HAS_POLLER = True
 except Exception:
     HAS_POLLER = False
@@ -185,6 +186,15 @@ def read_sessions() -> dict:
     # de instancias, el contexto y el costo, que el endpoint no conoce.
     if HAS_POLLER:
         u = load_json(USAGE_PATH, None)
+        # Preferir lo que el poller tiene en memoria si es mas nuevo que el
+        # disco: el fetch de red y la escritura de usage.json son pasos
+        # separados, y un filtro de archivos de antivirus puede bloquear el
+        # segundo durante minutos u horas sin que el primero falle nunca
+        # (visto en produccion, ver CLAUDE.md). Sin esto, ese bloqueo deja a
+        # la mascota "SIN DATOS" con un poller que en realidad sigue andando.
+        mem = get_last_usage()
+        if mem and (not u or mem.get("ts", 0) > u.get("ts", 0)):
+            u = mem
         if u:
             age = now - u.get("ts", 0)
             out["usage_age"] = age

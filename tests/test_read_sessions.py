@@ -4,6 +4,7 @@ import json
 import time
 
 import claude_pet
+import claude_pet_usage
 
 FIVE = {"used_percentage": 40, "resets_at": 1787672400}
 SEVEN = {"used_percentage": 52, "resets_at": 1787997600}
@@ -86,6 +87,46 @@ def test_poller_viejo_no_tapa_un_dato_recien_traido_por_el_statusline(
     out = claude_pet.read_sessions()
     assert out.get("usage_source") is None
     assert out["five_hour"] == fresco
+
+
+def test_poller_usa_memoria_cuando_el_disco_no_se_pudo_escribir(
+        pet, write_session, monkeypatch):
+    """Un antivirus puede bloquear la escritura de usage.json sin que el
+    fetch de red falle (visto en produccion con avgMonFltProxy, ver
+    CLAUDE.md). LAST_USAGE -- lo ultimo que el poller trajo con exito -- tiene
+    que taparle el paso a un usage.json vencido o inexistente en disco."""
+    monkeypatch.setattr(claude_pet, "HAS_POLLER", True)
+    now = time.time()
+    write_session("a", ts=now, rl_ts=now - 100,
+                  five_hour={"used_percentage": 30, "resets_at": 1})
+    # no hay usage.json en disco: la escritura del poller nunca se completo
+    monkeypatch.setattr(claude_pet_usage, "LAST_USAGE", {
+        "ts": now, "five_hour": FIVE, "seven_day": SEVEN,
+    })
+
+    out = claude_pet.read_sessions()
+    assert out["usage_source"] == "poller"
+    assert out["five_hour"] == FIVE
+
+
+def test_disco_gana_si_es_mas_nuevo_que_la_memoria(pet, write_session, monkeypatch):
+    """La memoria es un fallback, no una preferencia ciega: si el disco tiene
+    un dato mas nuevo que LAST_USAGE, gana el disco."""
+    monkeypatch.setattr(claude_pet, "HAS_POLLER", True)
+    now = time.time()
+    write_session("a", ts=now, rl_ts=now - 100,
+                  five_hour={"used_percentage": 30, "resets_at": 1})
+    (pet / "usage.json").write_text(json.dumps({
+        "ts": now, "five_hour": FIVE, "seven_day": SEVEN,
+    }), encoding="utf-8")
+    monkeypatch.setattr(claude_pet_usage, "LAST_USAGE", {
+        "ts": now - 50,
+        "five_hour": {"used_percentage": 99, "resets_at": 1},
+        "seven_day": SEVEN,
+    })
+
+    out = claude_pet.read_sessions()
+    assert out["five_hour"] == FIVE
 
 
 def test_poller_vencido_no_se_usa(pet, write_session, monkeypatch):

@@ -93,6 +93,15 @@ LAST_ERROR = None       # motivo del ultimo fallo, para diagnostico
 LAST_THROTTLED = False  # si el ultimo fallo fue un 429
 LAST_RETRY_AFTER = None  # segundos que pidio el server, si los mando
 
+# Ultimo dato traido con exito de la red, aunque no se haya podido persistir a
+# disco. El fetch y la escritura son pasos separados: un filtro de archivos de
+# antivirus (visto en produccion: avgMonFltProxy interceptando la escritura
+# atomica de usage.json, ver CLAUDE.md) puede bloquear el segundo durante
+# minutos u horas sin que el primero falle nunca. Sin este cache, esos
+# bloqueos tiran usage.json fuera de USAGE_FRESH y la mascota se queda "SIN
+# DATOS" pese a que el poller sigue trayendo numeros validos ciclo a ciclo.
+LAST_USAGE = None
+
 
 def _epoch(iso):
     """'2026-08-25T15:40:00.883877+00:00' -> epoch float.
@@ -210,15 +219,23 @@ def poll_interval(cfg: dict) -> int:
                int(cfg.get("usage_poll_seconds", DEFAULT_POLL_SECONDS)))
 
 
+def get_last_usage() -> dict | None:
+    """El fetch mas reciente que salio bien, exista o no en disco.
+
+    claude_pet.py corre el poller en un hilo del mismo proceso, asi que puede
+    leer esto directo en vez de pasar siempre por USAGE_PATH -- eso es lo que
+    lo saltea a AVG (o cualquier otra cosa que bloquee la escritura) sin tocar
+    su configuracion."""
+    return LAST_USAGE
+
+
 def poll_once() -> bool:
-    """True si pudo refrescar. El motivo del fallo queda en LAST_ERROR."""
-    global LAST_ERROR, LAST_THROTTLED, LAST_RETRY_AFTER
+    """True si pudo refrescar Y persistir en disco. El motivo del fallo queda
+    en LAST_ERROR. LAST_USAGE se actualiza con el dato recien traido aunque la
+    escritura a disco falle -- ver el comentario en su declaracion arriba."""
+    global LAST_ERROR, LAST_THROTTLED, LAST_RETRY_AFTER, LAST_USAGE
     try:
-        _save_atomic(fetch_usage())
-        LAST_ERROR = None
-        LAST_THROTTLED = False
-        LAST_RETRY_AFTER = None
-        return True
+        data = fetch_usage()
     except Exception as e:
         # Nunca romper la UI por esto: token vencido, red caida, schema
         # cambiado. La mascota se queda con el ultimo valor y reintenta.
@@ -227,6 +244,22 @@ def poll_once() -> bool:
         LAST_RETRY_AFTER = _retry_after(e) if LAST_THROTTLED else None
         LAST_ERROR = f"{type(e).__name__}: {e}"[:180]
         return False
+
+    LAST_USAGE = data
+    try:
+        _save_atomic(data)
+    except Exception as e:
+        # El fetch ya salio bien (LAST_USAGE quedo actualizado arriba); esto
+        # es solo la persistencia a disco fallando -- nunca un 429.
+        LAST_THROTTLED = False
+        LAST_RETRY_AFTER = None
+        LAST_ERROR = f"{type(e).__name__}: {e}"[:180]
+        return False
+
+    LAST_ERROR = None
+    LAST_THROTTLED = False
+    LAST_RETRY_AFTER = None
+    return True
 
 
 def _loop(interval: int) -> None:

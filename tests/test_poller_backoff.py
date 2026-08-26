@@ -105,6 +105,27 @@ def test_exito_limpia_el_estado(creds, monkeypatch):
     assert usage.LAST_RETRY_AFTER is None
 
 
+def test_falla_al_escribir_no_pierde_el_dato_en_memoria(creds, monkeypatch):
+    """El fetch de red y la escritura a disco son pasos separados: un
+    PermissionError al escribir (AVG interceptando la escritura atomica,
+    visto en produccion, ver CLAUDE.md) no debe tirar el dato recien traido.
+    LAST_USAGE tiene que quedar actualizado igual -- es lo que claude_pet.py
+    usa como fallback cuando usage.json no se pudo persistir."""
+    class _R:
+        def read(self, *a):
+            return json.dumps({"five_hour": {"utilization": 42.0,
+                                             "resets_at": "2026-08-25T20:40:00+00:00"}}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(usage.urllib.request, "urlopen", lambda r, timeout=None: _R())
+    monkeypatch.setattr(usage, "_save_atomic",
+                         lambda data: (_ for _ in ()).throw(PermissionError("avgMonFltProxy")))
+
+    assert usage.poll_once() is False
+    assert usage.get_last_usage()["five_hour"]["used_percentage"] == 42
+    assert "PermissionError" in usage.LAST_ERROR
+
+
 # --------------------------------------------------------- espera tras 429
 
 def test_obedece_el_retry_after_del_server(monkeypatch):

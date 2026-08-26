@@ -41,6 +41,9 @@ def pet(tmp_path, monkeypatch):
     monkeypatch.setattr(claude_pet_usage, "PET_DIR", tmp_path)
     monkeypatch.setattr(claude_pet_usage, "USAGE_PATH", tmp_path / "usage.json")
     monkeypatch.setattr(claude_pet_usage, "STATE_PATH", tmp_path / "poller_state.json")
+    # sin esto, el LAST_USAGE que dejo un test de poller anterior se filtra
+    # a read_sessions() de otro test via get_last_usage()
+    monkeypatch.setattr(claude_pet_usage, "LAST_USAGE", None)
 
     monkeypatch.setattr(claude_pet_collector, "PET_DIR", tmp_path)
     monkeypatch.setattr(claude_pet_collector, "SESSIONS_DIR", sessions)

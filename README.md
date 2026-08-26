@@ -11,7 +11,7 @@ sesiones de Claude Code en 95%+ — con notificacion nativa del SO y sonido.
 [ collector ]  statusLine de Claude Code, corre local, 0 tokens
       |        escribe ~/.claude/pet/sessions/<id>.json  <- solo en la TUI
       v
-[ mascota ]    PySide6, lee cada 1s, dibuja, dispara toast + tono
+[ mascota ]    PySide6, lee cada 1s, dibuja, dispara notificacion + tono
 ```
 
 Las dos fuentes reportan las mismas ventanas y la mascota se queda con la mas
@@ -112,8 +112,9 @@ Quedo funcionando de punta a punta: se creo la app, se instalo, y una alerta
 real llego al DM. Se desactivo despues por dos razones, no porque algo fallara:
 
 1. **El pedido real era otro.** "Push del sistema" resulto significar
-   notificacion en la misma maquina donde corre la mascota — eso es el toast de
-   Windows (seccion de abajo), no algo que necesite salir a internet.
+   notificacion en la misma maquina donde corre la mascota — eso es la
+   notificacion nativa del SO (toast en Windows, centro de notificaciones en
+   macOS), no algo que necesite salir a internet.
 2. **En un Slack corporativo, Slack trae friccion que no vale la pena.**
    *Create New App* suele requerir permiso de admin, y aunque lo tengas, la app
    queda listada en "Agentes y aplicaciones" para cualquiera del workspace que
@@ -191,10 +192,13 @@ Para que arranque sola:
 
 ---
 
-## macOS: lo que es distinto
+## macOS: notas de plataforma
 
-Portado y verificado el 25/8/2026 contra macOS 26.6.2 (arm64). Todo lo de este
-README aplica igual salvo lo siguiente.
+El resto del README aplica igual en las dos plataformas — las secciones de
+umbrales, alarma, corte y config explican los dos mundos. Aca queda solo lo
+que es especifico de macOS y no tiene equivalente en Windows.
+
+Portado y verificado el 25/8/2026 contra macOS 26.6.2 (arm64).
 
 **Las credenciales no estan en un archivo, estan en el Keychain.** En Windows
 y Linux el token OAuth vive en `~/.claude/.credentials.json`. En Mac ese
@@ -212,25 +216,10 @@ Si la primera lectura abre el dialogo del Keychain, dale **"Permitir
 siempre"**: bajo `launchd` no hay nadie para autorizarlo y el poller queda
 sin token.
 
-**El corte automatico mata las sesiones de terminal tambien.** En Windows el
-filtro es por ruta, porque `claude.exe` es un nombre ambiguo que comparte con
-la app de escritorio. En Mac el problema es el opuesto:
-
-| proceso | `ps -axo comm=` | corte |
-|---|---|---|
-| panel de VS Code | `.../native-binary/claude` | mata |
-| CLI nativo en terminal | `claude` | mata |
-| app de escritorio | `/Applications/Claude.app/Contents/MacOS/Claude` | **no toca** |
-| helpers de Electron | `Claude Helper (Renderer)` | **no toca** |
-
-El nombre no es ambiguo (`Claude` != `claude`), asi que alcanza con comparar
-el **basename, case-sensitive**. Y tiene que ser por basename y no por ruta,
-porque el CLI nativo (`~/.local/bin/claude`) sale **pelado** en `ps`: es un
-symlink y `ps` no lo resuelve. Un filtro por marcador de ruta como el de
-Windows dejaria vivas todas las sesiones de terminal, que queman la ventana
-de 5h igual que las del panel.
-
-Para auditar el filtro sin matar nada:
+**El corte automatico alcanza tambien a las sesiones de terminal**, no solo al
+panel de VS Code — el porque esta en
+[Corte automatico](#corte-automatico-mata-las-sesiones-de-claude-code-al-95),
+junto al caso de Windows. Para auditar el filtro sin matar nada:
 
 ```bash
 ~/.claude/pet/.venv/bin/python -c "import claude_pet; print(claude_pet._pids_darwin())"
@@ -243,15 +232,10 @@ como `python claude_pet.py` no hay bundle (`lsappinfo` lo confirma:
 fallar para un canal de alerta. Por eso `_notify()` usa `osascript` en darwin.
 La primera vez puede pedir permiso en Ajustes del Sistema -> Notificaciones.
 
-**El sonido usa `afplay`.** No hay equivalente a `winsound.Beep(freq, ms)` en
-la stdlib, pero con los `.aiff` del sistema se conserva lo que importa: que
-aviso y alarma suenen **distinto**, no solo una cantidad distinta de veces del
-mismo beep. Tink+Glass para aviso, Funk<->Basso x2 para alarma.
-
-La eleccion es por **timbre**, no por volumen: el primer intento fue
-Ping+Glass / Sosumi x3 y no servia, porque los tres son campanitas agudas y
-sin mirar la pantalla no se distinguia un aviso de una alarma. Probado a oido
-el 26/8/2026.
+**El sonido usa `afplay`** sobre los `.aiff` del sistema, porque no hay
+equivalente a `winsound.Beep(freq, ms)` en la stdlib. La tabla de tonos de las
+tres plataformas esta en
+[Detalles de implementacion](#detalles-de-implementacion-que-importan).
 
 **La instancia unica necesitaba un fix.** El comentario original decia que en
 Windows el SO libera el bloque de `QSharedMemory` al morir el proceso, asi que
@@ -345,12 +329,18 @@ sonido o toast ahi no aporta nada, así que se apagan a proposito.
 
 ## Alarma en pantalla completa
 
-En 90% (`alarm_thresholds`), ademas del toast y el sonido, se abre una
-pantalla completa en tu **monitor principal** — el mismo que Windows llama
-"Pantalla principal" en Configuracion -> Sistema -> Pantalla, sin importar en
-cual de tus monitores este la mascota. Pensada para cuando las notificaciones
-estan muteadas, no tenes los auriculares puestos, o estas mirando otro
-monitor: es el unico canal que no depende de verla ni de escucharla a tiempo.
+En 90% (`alarm_thresholds`), ademas de la notificacion y el sonido, se abre
+una pantalla completa en tu **monitor principal**, sin importar en cual de tus
+monitores este la mascota. Es el que cada SO designa como principal:
+
+| | donde se define |
+|---|---|
+| Windows | Configuracion -> Sistema -> Pantalla -> "Pantalla principal" |
+| macOS | Ajustes del Sistema -> Pantallas -> la que tiene la barra de menus |
+
+Pensada para cuando las notificaciones estan muteadas, no tenes los
+auriculares puestos, o estas mirando otro monitor: es el unico canal que no
+depende de verla ni de escucharla a tiempo.
 
 Por eso **no se corta con `muted`**: es a proposito, es el respaldo para
 cuando el resto esta silenciado. Se cierra con un clic, cualquier tecla, o
@@ -377,20 +367,41 @@ ventana de 5h, la mascota:
    notificacion del SO** — a esta altura ya sonaron cinco avisos antes (25,
    50, 75, 85, 90%); la unica alerta que falta es la que corta de verdad.
 
-**Que NO toca.** Solo el proceso `claude.exe` del agente — el que
+**Que NO toca.** Solo el proceso del agente de Claude Code — el que
 efectivamente consume la ventana de 5h. VS Code, la terminal que lo lanzo, y
 la app de escritorio de Claude siguen abiertos: la ventana/pestaña donde
 estaba esa sesion va a mostrar que se desconecto, pero el resto del programa
 sigue andando. No cierra editores, no pierde el resto de tu trabajo.
 
-**Por que no basta con matar por nombre de proceso.** `claude.exe` es
-ambiguo: la app de escritorio de Claude usa el MISMO nombre de ejecutable
-(`...\WindowsApps\Claude_...\app\claude.exe`) para un producto que no tiene
-nada que ver con la ventana de 5h. Filtrar por nombre a secas mataria esa app
-tambien. El filtro real usa la ruta especifica del binario nativo que trae la
-extension de VS Code
-(`.../extensions/anthropic.claude-code-*/resources/native-binary/claude.exe`),
-verificado contra los procesos reales de esta maquina.
+**Identificar ese proceso es el problema dificil, y es distinto en cada SO.**
+En los dos casos hace falta un filtro preciso, pero por motivos opuestos:
+
+| | el CLI se ve como | la app de escritorio se ve como | el riesgo |
+|---|---|---|---|
+| **Windows** | `claude.exe` | `claude.exe` | el nombre es **ambiguo**: filtrar por nombre mataria la app de escritorio |
+| **macOS** | `.../native-binary/claude` (panel de VS Code) o `claude` a secas (CLI nativo) | `Claude`, `Claude Helper (...)` | el nombre alcanza, pero la **ruta no siempre esta**: filtrar por ruta dejaria viva la sesion de terminal |
+
+- **Windows** desempata por ruta: usa el segmento especifico del binario
+  nativo que trae la extension de VS Code
+  (`.../extensions/anthropic.claude-code-*/resources/native-binary/claude.exe`),
+  porque la app de escritorio comparte el nombre de ejecutable
+  (`...\WindowsApps\Claude_...\app\claude.exe`) para un producto que no tiene
+  nada que ver con la ventana de 5h.
+
+- **macOS** compara el **basename, case-sensitive**, contra `claude`. Ahi el
+  nombre no es ambiguo (`Claude` != `claude`), asi que la app de escritorio y
+  sus helpers quedan afuera solos. Y tiene que ser por basename y no por ruta,
+  porque el CLI nativo (`~/.local/bin/claude`) es un symlink que `ps` no
+  resuelve: sale pelado, sin ruta. Un filtro por ruta cubriria el panel de
+  VS Code pero dejaria viva cada sesion de terminal, que quema la ventana de
+  5h exactamente igual.
+
+Los dos filtros estan verificados contra los procesos reales de sus maquinas.
+En macOS podes auditar el tuyo sin matar nada:
+
+```bash
+python3 -c "import claude_pet; print(claude_pet._pids_darwin())"
+```
 
 **Solo alcanza a esta maquina.** Si usas Claude Code desde otra computadora,
 o via un agente en la nube, el corte automatico no llega ahi — protege
@@ -403,10 +414,24 @@ Para apagarlo, `auto_kill_enabled: false`.
 
 ## Detalles de implementacion que importan
 
-**El sonido corre en un hilo aparte.** `winsound.Beep()` es sincronico: llamarlo
-en el hilo de Qt bloquearia el tick de 1s y la animacion de 50ms mientras dura
-la secuencia (hasta ~700ms en la alarma). `_play_alert()` lo tira en un hilo
-daemon; sin winsound (mac/Linux) cae al beep generico de Qt.
+**El sonido corre en un hilo aparte.** Las dos APIs nativas son sincronicas
+—`winsound.Beep()` en Windows y `afplay` en macOS— asi que llamarlas en el hilo
+de Qt bloquearia el tick de 1s y la animacion mientras dura la secuencia (hasta
+~700ms en la alarma). `_play_alert()` las tira en un hilo daemon.
+
+**Y en los dos casos el tono es propio, no el beep del sistema.** Con el beep
+generico de Qt, aviso y alarma **suenan igual** y solo se distinguen contando
+beeps — justo la informacion que necesitas sin mirar la pantalla:
+
+| | aviso | alarma |
+|---|---|---|
+| Windows | `winsound.Beep`, dos notas subiendo (988 -> 1319 Hz) | sirena alternada (1568 <-> 1175 Hz) x3 |
+| macOS | `afplay`: Tink -> Glass | Funk <-> Basso, x2 |
+| Linux | beep de Qt x1 | beep de Qt x3 |
+
+En macOS la eleccion es por **timbre**, no por volumen: el primer intento
+(Ping+Glass / Sosumi) hubo que descartarlo porque los tres son campanitas
+agudas y el problema seguia intacto.
 
 **Por que el collector no hace HTTP.** El statusLine bloquea la actualizacion de
 la barra mientras corre, y si llega un update nuevo mientras el script sigue

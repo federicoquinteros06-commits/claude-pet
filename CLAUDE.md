@@ -410,81 +410,90 @@ como "vivo" varios cientos de ms después de matarlo — caché de WMI. `Get-Pro
 tiene este problema porque cuenta sobre la colección `$p` ya capturada, nunca
 re-consulta después de matar.
 
-## Corte por la ventana semanal al 97% (26/8)
+## La ventana semanal, escalera completa (26/8)
 
-Segundo disparador del corte automático, a pedido del usuario. La decisión de
-cortar salió de `Pet.tick()` a una función de módulo:
+Antes la semanal era un par de umbrales de aviso colgados del mismo código que
+la de 5h. Ahora tiene escalera propia, con corte, y **texto y color propios**:
+
+| semanal | qué pasa | dónde |
+|---|---|---|
+| 85 / 95% | aviso: notif + sonido, **sin** pantalla completa | `seven_day_thresholds`, todos `warn` |
+| 98% | pantallazo violeta + corte, **una vez** | `kill_events()` |
+| 98–99%, c/60 min | pantallazo violeta, sin cortar | `seven_day_reminder()` |
+| 100%+ | pantallazo violeta + corte **cada `usage_poll_seconds`** | `hard_kill_due()` |
+
+Las tres funciones de decisión (`kill_events`, `seven_day_reminder`,
+`hard_kill_due`) son de módulo, fuera de `Pet`, por la misma razón que
+`_pids_darwin()`: es la única forma de auditar **cuándo** se corta sin levantar
+Qt y sin matar nada. `tests/test_kill_windows.py` las cubre con 39 tests.
+
+### Rojo es la de 5h, violeta es la semanal
+
+`WINDOW_UI` es la única tabla que decide cómo se ve cada ventana:
 
 ```python
-KILL_WINDOWS = (
-    ("five_hour", "kill_threshold", 95, "de la ventana de 5h"),
-    ("seven_day", "seven_day_kill_threshold", 97, "de la ventana semanal"),
-)
-kill_events(engine, cfg, state) -> [(etiqueta, umbral, pct)]
+WINDOW_UI = {
+    "five_hour": ("Claude Code · 5h",     "de la ventana de 5h",    "alarm"),
+    "seven_day": ("Claude Code · semana", "de la ventana semanal",  "credit"),
+}
 ```
 
-Está afuera de `Pet` por la misma razón que `_pids_darwin()`: es la única forma
-de auditar **cuándo** se corta sin levantar Qt y sin matar nada.
-`tests/test_kill_windows.py` cubre `kill_events()` y `seven_day_reminder()` con
-29 tests.
+El motivo no es estético. Los dos cortes se veían **idénticos** —mismo rojo,
+mismo texto "uso de sesion N%", mismo título "Claude Code"— y no significan lo
+mismo: la de 5h se destraba en horas, la semanal puede tardar 7 días. En la
+bandeja de notificaciones el título es lo único que se lee de reojo, así que
+ahí va el `· 5h` / `· semana`.
 
-**Tres decisiones que no son obvias leyendo el código:**
+Efecto secundario: se arregló un texto que estaba mal desde antes. `_fire()`
+decía `"uso de sesion {pct}%"` para las **dos** ventanas, así que un aviso del
+95% semanal se anunciaba como si fuera de sesión.
 
-1. **97, no 95.** Los dos cortes no cuestan lo mismo si se disparan de más: la
-   ventana de 5h se destraba en horas, la semanal puede tardar 7 días.
+`_fire()` ahora recibe la ventana como primer parámetro; `tick()` se la
+antepone a lo que devuelve `AlertEngine.check()`, que quedó sin tocar.
 
-2. **Un solo corte por ventana semanal**, heredado de `AlertEngine` y acá
-   deliberado, no accidental. Si cortara en cada poll, cruzar el 97% dejaría
-   la máquina sin Claude Code hasta el reset — y como el corte se lleva puesta
-   la sesión de terminal, no habría dónde apagar la opción. Un corte, el aviso
-   en pantalla completa, y después es decisión del usuario.
-   `test_semanal_corta_una_sola_vez_por_ventana` lo fija.
+### El corte duro no dedupea, y es la excepción
 
-3. **Un solo corte por tick aunque crucen las dos ventanas.** `tick()` dispara
-   `cortes[-1]`; el segundo corte no encontraría nada vivo y anunciaría "no
-   había sesiones", que es peor que no decir nada. `engine.check()` ya marcó
-   los dos umbrales, así que ninguno queda pendiente para el tick siguiente.
-   `KILL_WINDOWS` deja la semanal al final justamente porque es la que el
-   usuario tiene que leer.
+Todo lo demás pasa por `AlertEngine`, que dispara una vez por ventana. El corte
+del 100% no: `hard_kill_due()` es una función de tiempo, no de umbral cruzado,
+y se repite cada `usage_poll_seconds`. A pedido explícito — "por si se me
+escapa algo".
 
-`Pet.kill_result` pasó de `Signal(int, float)` a `Signal(int, float, str)`: la
-etiqueta viaja hasta `_on_kill_result()` porque los dos cortes se ven idénticos
-en pantalla y no significan lo mismo.
+Se ancla a `usage_poll_seconds` y no a un intervalo propio porque entre poll y
+poll el `%` es el mismo número viejo: cortar más seguido no aportaría nada.
 
-**El recordatorio es la otra mitad del punto 2.** Cortar una sola vez sería
-quedarse mudo por días justo cuando peor está la cuenta, así que
-`seven_day_reminder()` (misma forma que `kill_events()`: función de módulo,
-testeable sin Qt) devuelve el % si toca recordar, o `None`. `tick()` lo llama
-en el `else` del corte — nunca los dos en el mismo tick — y
-`_fire_seven_day_reminder()` abre la pantalla completa en **violeta**
-(`MOODS["credit"]`), no en rojo: hasta acá todo pantallazo rojo significó "algo
-acaba de pasar", y este no hace nada. El usuario lo va a ver varias veces
-durante días; distinguirlo de un corte de un vistazo importa.
+`tick()` llama a `kill_events()` **siempre**, aun cuando gane el corte duro, y
+recién después elige. Saltearlo dejaría el umbral del 98% sin marcar y por lo
+tanto pendiente para más tarde en la misma ventana.
 
-Dos decisiones del recordatorio:
+### Firma del resultado
 
-- **Se ancla a `seven_day_kill_threshold`**, no tiene umbral propio. Dos
-  números para la misma línea de peligro se desincronizan.
-- **No mira `auto_kill_enabled`.** Apagar el corte apaga el corte, no la
-  información. `test_no_depende_de_auto_kill` lo fija.
+`Pet.kill_result` es `Signal(int, float, str, bool)`: n, pct, ventana, y si el
+corte se repite. El `bool` cambia el mensaje final — "se cerraron 3 sesiones" a
+secas deja creer que se puede volver a abrir, y arriba del 100% no.
 
-`Pet.recordatorio_at` arranca en `0.0` a propósito (avisa en el primer tick si
-ya estás pasado) y vive en memoria, no en disco: un reinicio re-avisando es
-correcto, y persistirlo sería un archivo más que puede quedar viejo.
+`Pet.recordatorio_at` y `Pet.corte_duro_at` arrancan en `0.0` a propósito
+(actúan en el primer tick si ya estás pasado) y viven en memoria, no en disco:
+un reinicio re-avisando es correcto, y persistirlos sería un archivo más que
+puede quedar viejo.
 
-**Verificado en vivo, no solo en tests** (con `_kill_claude_code_processes`
-reemplazado por un stub — no murió ningún proceso), cuatro ticks seguidos sobre
-`usage.json` con la semanal al 98:
+### Verificado en vivo, no solo en tests
 
-| tick | | resultado |
-|---|---|---|
-| 1 | cruza el 97% | aviso semanal del 95 + CORTANDO + CORTADO, los tres rojos |
-| 2 | 1s después | silencio |
-| 3 | +1h (reloj adelantado a mano) | SEMANA AL LIMITE, violeta, **sin** volver a matar |
-| 4 | 1s después | silencio |
+Con `_kill_claude_code_processes` y `_play_alert` reemplazados por stubs (no
+murió ningún proceso), la escalera entera en una corrida:
 
-El kill se llamó exactamente **una** vez, y `fired.json` quedó con
-`seven_day:95:...` y `seven_day_kill:97:...` como claves separadas.
+| semana | resultado |
+|---|---|
+| 85 | 🔔 `[Claude Code · semana]` aviso, sin pantalla |
+| 95 | 🔔 aviso, sin pantalla, sin corte |
+| 98 | 🟣 CORTANDO + CORTADO, 1 corte |
+| 98, +1s | silencio |
+| 98, +1h | 🟣 SEMANA AL LIMITE, **sin** cortar |
+| 100 | 🟣 CORTANDO + CORTADO + "va a seguir cortando cada 140s" |
+| 100, +1s | silencio |
+| 100, +140s | 🟣 corta otra vez |
+| 5h a 90 (control) | 🔴 pantallazo rojo con wording de 5h |
+
+4 cortes en total, exactamente donde correspondía.
 
 ## Alertas y semáforo rediseñados (25/8, tarde)
 

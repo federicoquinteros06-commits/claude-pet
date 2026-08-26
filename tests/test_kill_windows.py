@@ -10,8 +10,8 @@ import claude_pet
 R5 = 1787763000      # resets_at de la ventana de 5h
 R7 = 1788350400      # resets_at de la ventana semanal
 
-SEMANAL = "de la ventana semanal"
-CINCO_H = "de la ventana de 5h"
+SEMANAL = "seven_day"
+CINCO_H = "five_hour"
 
 
 def estado(five=None, seven=None):
@@ -27,23 +27,24 @@ def eventos(engine, cfg=None, **kw):
 
 # --------------------------------------------------------------- la semanal
 
-def test_semanal_al_97_corta(pet):
+def test_semanal_al_98_corta(pet):
     engine = claude_pet.AlertEngine({})
-    assert eventos(engine, seven=97) == [(SEMANAL, 97, 97)]
+    assert eventos(engine, seven=98) == [(SEMANAL, 98, 98)]
 
 
-def test_semanal_al_96_no_corta(pet):
+def test_semanal_al_97_no_corta(pet):
+    """97 cae entre el aviso del 95 y el corte del 98: no corta."""
     engine = claude_pet.AlertEngine({})
-    assert eventos(engine, seven=96) == []
+    assert eventos(engine, seven=97) == []
 
 
 def test_semanal_corta_una_sola_vez_por_ventana(pet):
     """El punto delicado del feature: la ventana semanal puede tardar dias en
-    resetear. Si el corte se repitiera en cada poll, cruzar el 97% dejaria la
+    resetear. Si el corte se repitiera en cada poll, cruzar el 98% dejaria la
     maquina sin Claude Code hasta el reset."""
     engine = claude_pet.AlertEngine({})
-    assert len(eventos(engine, seven=97)) == 1
-    assert eventos(engine, seven=98) == []
+    assert len(eventos(engine, seven=98)) == 1
+    assert eventos(engine, seven=99) == []
     assert eventos(engine, seven=100) == []
 
 
@@ -52,7 +53,7 @@ def test_semanal_se_rearma_con_la_ventana_nueva(pet):
     assert len(eventos(engine, seven=99)) == 1
     otra = {"five_hour": None,
             "seven_day": {"used_percentage": 99, "resets_at": R7 + 604800}}
-    assert claude_pet.kill_events(engine, {}, otra) == [(SEMANAL, 97, 99)]
+    assert claude_pet.kill_events(engine, {}, otra) == [(SEMANAL, 98, 99)]
 
 
 def test_umbral_semanal_configurable(pet):
@@ -83,7 +84,7 @@ def test_cinco_horas_al_95_sigue_cortando(pet):
 def test_none_apaga_solo_la_de_5h(pet):
     engine = claude_pet.AlertEngine({})
     cfg = {"kill_threshold": None}
-    assert eventos(engine, cfg, five=99, seven=98) == [(SEMANAL, 97, 98)]
+    assert eventos(engine, cfg, five=99, seven=98) == [(SEMANAL, 98, 98)]
 
 
 # ------------------------------------------------------------ las dos juntas
@@ -93,7 +94,7 @@ def test_las_dos_a_la_vez_devuelve_la_semanal_ultima(pet):
     que leer la semanal, que es la que no se destraba en horas."""
     engine = claude_pet.AlertEngine({})
     ev = eventos(engine, five=96, seven=98)
-    assert ev == [(CINCO_H, 95, 96), (SEMANAL, 97, 98)]
+    assert ev == [(CINCO_H, 95, 96), (SEMANAL, 98, 98)]
     assert ev[-1][0] == SEMANAL
 
 
@@ -101,18 +102,20 @@ def test_cada_ventana_dedupea_por_su_cuenta(pet):
     """Que la de 5h ya haya cortado no consume el corte de la semanal."""
     engine = claude_pet.AlertEngine({})
     assert eventos(engine, five=96, seven=3) == [(CINCO_H, 95, 96)]
-    assert eventos(engine, five=97, seven=97) == [(SEMANAL, 97, 97)]
+    assert eventos(engine, five=97, seven=98) == [(SEMANAL, 98, 98)]
 
 
 def test_el_aviso_semanal_no_consume_el_corte(pet):
     """seven_day_thresholds (aviso) y seven_day_kill (corte) miran la misma
     ventana con namespaces distintos: cruzar 95 avisando no puede comerse la
-    clave del corte de 97."""
+    clave del corte de 98."""
     engine = claude_pet.AlertEngine({})
     info = {"used_percentage": 98, "resets_at": R7}
-    avisos = engine.check("seven_day", info, [85], [95])
+    # como los pasa tick(): los semanales son TODOS avisos, sin alarma
+    avisos = engine.check("seven_day", info, [85, 95], [])
     assert [t for _l, t, _p, _r in avisos] == [85, 95]
-    assert eventos(engine, seven=98) == [(SEMANAL, 97, 98)]
+    assert [lvl for lvl, _t, _p, _r in avisos] == ["warn", "warn"]
+    assert eventos(engine, seven=98) == [(SEMANAL, 98, 98)]
 
 
 # ------------------------------------------------------- interruptor maestro
@@ -129,11 +132,11 @@ def test_auto_kill_apagado_no_quema_los_umbrales(pet):
     nuevo dentro de la misma ventana ya no cortaria nunca."""
     engine = claude_pet.AlertEngine({})
     assert eventos(engine, {"auto_kill_enabled": False}, seven=99) == []
-    assert eventos(engine, {}, seven=99) == [(SEMANAL, 97, 99)]
+    assert eventos(engine, {}, seven=99) == [(SEMANAL, 98, 99)]
 
 
 def test_config_por_defecto_trae_el_umbral_semanal(pet):
-    assert claude_pet.DEFAULT_CONFIG["seven_day_kill_threshold"] == 97
+    assert claude_pet.DEFAULT_CONFIG["seven_day_kill_threshold"] == 98
 
 
 # ============================================ recordatorio de la semanal
@@ -158,7 +161,7 @@ def test_debajo_del_umbral_no_recuerda(pet):
 
 
 def test_justo_en_el_umbral_recuerda(pet):
-    assert recordatorio(seven=97) == 97
+    assert recordatorio(seven=98) == 98
 
 
 def test_antes_del_intervalo_no_repite(pet):
@@ -212,3 +215,67 @@ def test_al_arrancar_avisa_en_el_primer_tick(pet):
 
 def test_config_por_defecto_trae_el_intervalo(pet):
     assert claude_pet.DEFAULT_CONFIG["seven_day_reminder_minutes"] == 60
+
+
+# ================================================ corte duro del 100% semanal
+# Arriba del 100% el corte deja de dedupear: se repite cada `usage_poll_seconds`
+# mientras la semanal siga ahi. "Por si se me escapa algo".
+
+POLL = 140
+
+
+def duro(cfg=None, seven=100, ultimo=0.0, ahora=POLL):
+    return claude_pet.hard_kill_due(cfg or {}, estado(seven=seven),
+                                    ultimo, ahora)
+
+
+def test_al_100_corta(pet):
+    assert duro(seven=100) == 100
+
+
+def test_al_99_no_corta_duro(pet):
+    """99 ya lo cubrio el corte del 98, que dispara una sola vez."""
+    assert duro(seven=99) is None
+
+
+def test_se_repite_cada_intervalo_de_poll(pet):
+    assert duro(seven=100, ultimo=0.0, ahora=POLL - 1) is None
+    assert duro(seven=100, ultimo=0.0, ahora=POLL) == 100
+    assert duro(seven=100, ultimo=0.0, ahora=POLL * 10) == 100
+
+
+def test_sigue_el_intervalo_de_poll_configurado(pet):
+    """Se ancla a usage_poll_seconds: no tiene sentido cortar mas seguido de
+    lo que el dato se refresca."""
+    cfg = {"usage_poll_seconds": 300}
+    assert duro(cfg, ultimo=0.0, ahora=299) is None
+    assert duro(cfg, ultimo=0.0, ahora=300) == 100
+
+
+def test_al_arrancar_corta_en_el_primer_tick(pet):
+    """corte_duro_at arranca en 0: prender la mascota ya pasado el 100% corta
+    ya, no dentro de 140s."""
+    assert duro(seven=100, ultimo=0.0, ahora=1e9) == 100
+
+
+def test_umbral_duro_configurable(pet):
+    cfg = {"seven_day_hard_kill_threshold": 99}
+    assert duro(cfg, seven=99) == 99
+
+
+def test_none_apaga_el_corte_duro(pet):
+    assert duro({"seven_day_hard_kill_threshold": None}, seven=100) is None
+
+
+def test_auto_kill_apagado_apaga_el_corte_duro(pet):
+    """A diferencia del recordatorio, este SI mira el interruptor maestro:
+    corta procesos de verdad."""
+    assert duro({"auto_kill_enabled": False}, seven=100) is None
+
+
+def test_sin_dato_semanal_no_corta_duro(pet):
+    assert claude_pet.hard_kill_due({}, estado(five=100), 0.0, POLL) is None
+
+
+def test_config_por_defecto_trae_el_umbral_duro(pet):
+    assert claude_pet.DEFAULT_CONFIG["seven_day_hard_kill_threshold"] == 100

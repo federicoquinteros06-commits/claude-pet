@@ -35,6 +35,7 @@ POS_PATH = PET_DIR / "position.json"
 FRESH_WINDOW = 300  # una sesion cuenta como viva si escribio hace < 5 min
 STALE_HINT = 90     # a partir de aca la mascota avisa que el dato envejece
 POLL_MS = 1000
+ANIM_MS = 50        # ver Pet._sync_anim: no corre siempre, solo si hay que animar
 
 # El poller de /api/oauth/usage es opcional: si falta el modulo la mascota
 # sigue andando con lo que reporte el collector del statusLine.
@@ -653,7 +654,7 @@ class Pet(QtWidgets.QWidget):
 
         self.anim = QtCore.QTimer(self)
         self.anim.timeout.connect(self._animate)
-        self.anim.start(50)
+        self.anim.start(ANIM_MS)
 
         self._build_tray()
 
@@ -734,6 +735,7 @@ class Pet(QtWidgets.QWidget):
         five = self.state.get("five_hour")
         pct = (five or {}).get("used_percentage")
         self.mood = self._mood_for(pct)
+        self._sync_anim()
 
         events = self.engine.check(
             "five_hour", five,
@@ -793,6 +795,7 @@ class Pet(QtWidgets.QWidget):
         _play_alert(level)
 
         self.flash_until = time.time() + (4 if level == "alarm" else 1.5)
+        self._sync_anim()  # sin esto el flash esperaria hasta 1s al proximo tick
 
     def _trigger_kill(self, value):
         """Corte inmediato al cruzar `kill_threshold` (95% por defecto). Sin
@@ -828,6 +831,41 @@ class Pet(QtWidgets.QWidget):
                 f"{value:.0f}% de uso · se cerraron {n} sesion{plural} de "
                 "Claude Code.")
         self.alert_screen.show_alert(headline, detail, MOODS["alarm"][0])
+
+    def _anim_en_pausa(self) -> bool:
+        """Si conviene apagar la animacion del todo.
+
+        Solo en "calm" (< 50%, MOOD_BREAKPOINTS[0]). De ahi para arriba la
+        mascota se sigue moviendo igual que siempre, aunque en "watch" y
+        "warn" tampoco dibuje: a partir del 50% se prefiere no tocar nada.
+
+        Nunca se pausa durante un flash, aunque el estado sea calm: el flash
+        es una alerta en curso.
+        """
+        return self.mood == "calm" and time.time() >= self.flash_until
+
+    def _sync_anim(self) -> None:
+        """Prende y apaga el timer de animacion.
+
+        A 50ms despierta 20 veces por segundo. En macOS eso impide que el CPU
+        entre en reposo profundo, que pesa mas en la bateria que el 0.3% de
+        CPU que se mide. Y en calm no compraba nada: paintEvent solo corre con
+        el tick de 1s, para cuando `pulse` ya avanzo 20 pasos (2.4 rad), asi
+        que el logo pegaba un saltito de tamaño por segundo en vez de
+        respirar. Apagarlo ahi ahorra bateria Y saca el jitter.
+
+        Se llama desde tick() (camino normal) y desde _fire() (para que el
+        flash arranque al instante y no espere hasta un segundo).
+        """
+        if self._anim_en_pausa():
+            if self.anim.isActive():
+                self.anim.stop()
+                # sin(0) = 0 -> breathe = 1.0, el logo queda en su tamaño de
+                # reposo en vez de congelado a mitad del ciclo
+                self.pulse = 0.0
+                self.update()
+        elif not self.anim.isActive():
+            self.anim.start(ANIM_MS)
 
     def _animate(self):
         self.pulse += 0.12

@@ -140,20 +140,47 @@ nuevas.
 | Overlay, colores, barra, tray icon | Anda por Qt | ✅ verificado |
 | Sonido | `afplay` + .aiff del sistema | ✅ portado |
 | Notificacion del SO | **Qt no sirve**, va por `osascript` | ✅ portado |
-| Pantalla completa (`AlertScreen`) | Anda | ⚠️ sin probar contra Spaces |
+| Pantalla completa (`AlertScreen`) | Anda, con el fix de Spaces | ✅ portado |
 | **Corte automatico** | `ps` + basename + `SIGTERM`/`SIGKILL` | ✅ portado |
 | Instancia unica (`QSharedMemory`) | **Necesitaba el fix POSIX** | ✅ portado |
 | Icono en el Dock | `ctypes` + activation policy | ✅ portado |
+| Visibilidad (Spaces, deactivate) | `_mac_keep_visible()` | ✅ portado |
 | Autostart | `launchd`, receta completa en el README | ✅ |
+
+### La mascota directamente desaparecia (encontrado usandola)
+
+El analisis previo marcaba Spaces como "sin verificar" y sospechaba del
+comportamiento de `WindowStaysOnTopHint`. El problema real era anterior y mas
+basico, y aparecio a los minutos de usarla: **`Qt.Tool` en macOS es un NSPanel
+con `hidesOnDeactivate=YES`**. La ventana se esconde sola cuando la app no es
+la activa — y la mascota **nunca** es la activa, que es exactamente para lo
+que se eligio `Qt.Tool` (no robar foco). El overlay se ocultaba apenas tocabas
+otra ventana.
+
+Medido sobre la ventana real, antes y despues:
+
+| | antes | despues |
+|---|---|---|
+| `hidesOnDeactivate` | `True` | `False` |
+| `collectionBehavior` | `258` | `257` |
+| `level` | `8` | `25` |
+
+El `258` (`MoveToActiveSpace | FullScreenAuxiliary`) explica la segunda mitad:
+MoveToActiveSpace mueve la ventana al Space activo *cuando la app se activa*,
+y esta app no se activa nunca — asi que se quedaba en el Space donde nacio. Y
+el nivel 8 queda por debajo de una app en fullscreen.
+
+Fix: `_mac_keep_visible()` — `Qt.WA_MacAlwaysShowToolWindow` mas
+`setCollectionBehavior:` / `setLevel:` / `setHidesOnDeactivate:` por ctypes.
+Se aplica a la mascota y tambien a `AlertScreen`, donde importa mas: la
+pantalla completa es el unico canal que no se corta con `muted`.
 
 ## Lo que sigue sin verificar
 
-**La pantalla completa contra Mission Control / Spaces.** Era el punto 3 de la
-lista de "que haria falta para un port real" y sigue abierto: no se probo si
-`WindowStaysOnTopHint` sobrevive un cambio de Space, ni si el fullscreen tapa
-la barra de menu o el notch. Vale la limitacion que ya documenta el README para
-Windows: una app en fullscreen exclusivo puede tapar cualquier ventana
-always-on-top.
+Si el fullscreen de `AlertScreen` tapa la barra de menu o el notch en los
+modelos que lo tienen. Y vale la limitacion que el README ya documenta para
+Windows: una app en fullscreen **exclusivo** (algunos juegos, algunos
+reproductores) puede tapar cualquier ventana always-on-top, esta incluida.
 
 ## Tests
 
@@ -170,7 +197,7 @@ modos de fallo (`ps` ausente, timeout, returncode ≠ 0).
 `-w`, que el archivo gane si existe, que un error explique el motivo, y que en
 Windows el fallo siga siendo `FileNotFoundError`.
 
-Suite completa: **123 tests**, sin red, corriendo desde el Mac (los tests
+Suite completa: **128 tests**, sin red, corriendo desde el Mac (los tests
 mockean `sys.platform`, asi que la rama de Windows se sigue verificando).
 
 ## Linux, de paso

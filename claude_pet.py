@@ -67,9 +67,15 @@ DEFAULT_CONFIG = {
     # `muted`: es el canal para cuando el resto esta silenciado.
     "fullscreen_alert_enabled": True,
     # Corte automatico: mata los procesos de Claude Code (no VS Code, no la
-    # terminal, no la app de escritorio) al cruzar `kill_threshold`.
+    # terminal, no la app de escritorio) al cruzar cualquiera de los dos
+    # umbrales de abajo. Es el interruptor maestro: apagado, no corta nunca.
     "auto_kill_enabled": True,
     "kill_threshold": 95,
+    # Segunda red, sobre la ventana semanal. Mas alto que el 95 de la de 5h
+    # porque equivocarse cuesta mas: la de 5h vuelve en horas, la semanal
+    # puede tardar dias. Dispara UNA sola vez por ventana semanal (ver
+    # kill_events). None apaga este corte sin tocar el de 5h.
+    "seven_day_kill_threshold": 97,
     "scale": 1.0,
     "usage_poller_enabled": True,   # consulta /api/oauth/usage; anda sin TUI
     "usage_poll_seconds": 140,  # ver DEFAULT_POLL_SECONDS en claude_pet_usage
@@ -554,6 +560,44 @@ class AlertEngine:
         return out
 
 
+KILL_WINDOWS = (
+    # (clave en el estado, clave en config, default, etiqueta para la pantalla)
+    ("five_hour", "kill_threshold", 95, "de la ventana de 5h"),
+    ("seven_day", "seven_day_kill_threshold", 97, "de la ventana semanal"),
+)
+
+
+def kill_events(engine: "AlertEngine", cfg: dict, state: dict) -> list:
+    """Umbrales de corte recien cruzados, mirando las DOS ventanas.
+
+    Devuelve [(etiqueta, umbral, pct)] en el orden de KILL_WINDOWS.
+
+    Vive afuera de Pet.tick() para poder testear la decision de cortar sin
+    levantar Qt ni matar nada -- misma razon que _pids_darwin().
+
+    La ventana semanal dispara una sola vez por ventana, igual que todo lo que
+    pasa por AlertEngine, y eso aca es deliberado: si volviera a cortar en cada
+    poll, cruzar el 97% dejaria la maquina sin Claude Code por dias, y ni
+    siquiera se podria abrir una terminal para apagar la opcion. Un corte, el
+    aviso en pantalla completa, y despues es decision del usuario.
+    """
+    if not cfg.get("auto_kill_enabled", True):
+        return []
+
+    out = []
+    for clave, cfg_key, default, etiqueta in KILL_WINDOWS:
+        umbral = cfg.get(cfg_key, default)
+        if umbral is None:
+            continue
+        # namespace propio ("<ventana>_kill") para que este dedupe no comparta
+        # claves con warn_thresholds/seven_day_thresholds: son eventos
+        # independientes aunque miren la misma ventana.
+        for _lvl, t, pct, _resets in engine.check(
+                f"{clave}_kill", state.get(clave), [], [umbral]):
+            out.append((etiqueta, t, pct))
+    return out
+
+
 # ============================================================ widget
 
 class AlertScreen(QtWidgets.QWidget):
@@ -630,7 +674,7 @@ class Pet(QtWidgets.QWidget):
     # _kill_claude_code_processes corre en un hilo aparte (es un subprocess,
     # hasta 15s de timeout): esta signal es como su resultado vuelve al hilo
     # de Qt para poder tocar el tray/AlertScreen sin crashear.
-    kill_result = QtCore.Signal(int, float)
+    kill_result = QtCore.Signal(int, float, str)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -760,15 +804,15 @@ class Pet(QtWidgets.QWidget):
         for level, threshold, value, resets_at in events:
             self._fire(level, threshold, value, resets_at)
 
-        if self.cfg.get("auto_kill_enabled", True):
-            # namespace distinto ("five_hour_kill") para que este dedupe no
-            # comparta claves con warn_thresholds/alarm_thresholds: son
-            # eventos independientes aunque miren la misma ventana.
-            kill_events = self.engine.check(
-                "five_hour_kill", five, [], [self.cfg.get("kill_threshold", 95)]
-            )
-            for _level, _threshold, value, resets_at in kill_events:
-                self._trigger_kill(value)
+        cortes = kill_events(self.engine, self.cfg, self.state)
+        if cortes:
+            # Un solo corte aunque crucen las dos ventanas en el mismo tick: el
+            # segundo no encontraria nada vivo y anunciaria "no habia sesiones".
+            # engine.check() ya marco los dos umbrales como disparados, asi que
+            # ninguno queda pendiente. Se anuncia el ultimo -- KILL_WINDOWS
+            # deja la semanal al final justamente porque es la peor noticia.
+            etiqueta, _umbral, value = cortes[-1]
+            self._trigger_kill(value, etiqueta)
 
         # el detalle completo del fallo no entra en el widget: va al tooltip
         err = self.state.get("poller_error")
@@ -807,38 +851,44 @@ class Pet(QtWidgets.QWidget):
         self.flash_until = time.time() + (4 if level == "alarm" else 1.5)
         self._sync_anim()  # sin esto el flash esperaria hasta 1s al proximo tick
 
-    def _trigger_kill(self, value):
-        """Corte inmediato al cruzar `kill_threshold` (95% por defecto). Sin
-        cuenta regresiva ni forma de cancelar, a pedido explicito: mata los
-        procesos de Claude Code ya, no VS Code ni la terminal que los lanzo.
+    def _trigger_kill(self, value, etiqueta="de la ventana de 5h"):
+        """Corte inmediato al cruzar un umbral de corte (95% de la ventana de
+        5h, 97% de la semanal). Sin cuenta regresiva ni forma de cancelar, a
+        pedido explicito: mata los procesos de Claude Code ya, no VS Code ni
+        la terminal que los lanzo.
 
         A esta altura NO suena ni notifica — a proposito. 25/50/75/85/90 ya
         avisaron con notif+sonido (90 con pantalla completa incluida); a
         95%+ la unica alerta que queda es la que corta de verdad, y sumar
-        sonido/toast encima no aporta nada."""
+        sonido/toast encima no aporta nada.
+
+        `etiqueta` dice CUAL ventana disparo: cortar por la semanal y por la de
+        5h se ven identicos en pantalla, pero no significan lo mismo -- una se
+        destraba en horas y la otra puede tardar dias."""
         self.alert_screen.show_alert(
-            "CORTANDO", f"{value:.0f}% de uso · cerrando las sesiones de "
+            "CORTANDO", f"{value:.0f}% {etiqueta} · cerrando las sesiones de "
             "Claude Code...", MOODS["alarm"][0])
 
         def _bg():
             n = _kill_claude_code_processes()
-            self.kill_result.emit(n, value)
+            self.kill_result.emit(n, value, etiqueta)
 
         threading.Thread(target=_bg, daemon=True).start()
 
-    def _on_kill_result(self, n: int, value: float):
+    def _on_kill_result(self, n: int, value: float,
+                        etiqueta: str = "de la ventana de 5h"):
         if n < 0:
             headline, detail = "ATENCION", (
-                f"{value:.0f}% de uso · no se pudo confirmar el corte "
+                f"{value:.0f}% {etiqueta} · no se pudo confirmar el corte "
                 "automatico — revisalo a mano.")
         elif n == 0:
             headline, detail = "CORTE AUTOMATICO", (
-                f"{value:.0f}% de uso · no habia sesiones de Claude Code "
+                f"{value:.0f}% {etiqueta} · no habia sesiones de Claude Code "
                 "corriendo en esta maquina.")
         else:
             plural = "es" if n != 1 else ""
             headline, detail = "CORTADO", (
-                f"{value:.0f}% de uso · se cerraron {n} sesion{plural} de "
+                f"{value:.0f}% {etiqueta} · se cerraron {n} sesion{plural} de "
                 "Claude Code.")
         self.alert_screen.show_alert(headline, detail, MOODS["alarm"][0])
 

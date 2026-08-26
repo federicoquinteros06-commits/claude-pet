@@ -202,7 +202,7 @@ modos de fallo (`ps` ausente, timeout, returncode ≠ 0).
 `-w`, que el archivo gane si existe, que un error explique el motivo, y que en
 Windows el fallo siga siendo `FileNotFoundError`.
 
-Suite completa: **143 tests**, sin red, corriendo desde el Mac (los tests
+Suite completa al cerrar el port: **143 tests**, sin red, corriendo desde el Mac (los tests
 mockean `sys.platform`, asi que la rama de Windows se sigue verificando).
 Incluye los del cache en memoria del poller (`4ffb72d`), que corren junto a
 los del port sin pisarse.

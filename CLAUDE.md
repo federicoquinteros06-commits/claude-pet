@@ -349,7 +349,8 @@ los procesos de Claude Code al cruzar `kill_threshold` (95% default,
 dedupe separado (`"five_hour_kill"`, vía `AlertEngine.check` reutilizado con
 `warns=[]`), y disparado por `Pet._trigger_kill()` → hilo daemon →
 `Pet.kill_result` signal → `_on_kill_result()` actualiza el `AlertScreen` ya
-abierto. A pedido explícito: **sin cuenta regresiva, sin cancelación** — el
+abierto. (El 26/8 se sumó un segundo disparador por la ventana semanal y la
+elección de namespace se movió a `kill_events()` — ver más abajo.) A pedido explícito: **sin cuenta regresiva, sin cancelación** — el
 usuario comparó las alternativas y prefirió corte inmediato una vez confirmado
 que solo mata el proceso `claude.exe`, no VS Code ni la terminal.
 
@@ -408,6 +409,52 @@ como "vivo" varios cientos de ms después de matarlo — caché de WMI. `Get-Pro
 (no-WMI) sí reflejaba el estado real al instante. La función de producción no
 tiene este problema porque cuenta sobre la colección `$p` ya capturada, nunca
 re-consulta después de matar.
+
+## Corte por la ventana semanal al 97% (26/8)
+
+Segundo disparador del corte automático, a pedido del usuario. La decisión de
+cortar salió de `Pet.tick()` a una función de módulo:
+
+```python
+KILL_WINDOWS = (
+    ("five_hour", "kill_threshold", 95, "de la ventana de 5h"),
+    ("seven_day", "seven_day_kill_threshold", 97, "de la ventana semanal"),
+)
+kill_events(engine, cfg, state) -> [(etiqueta, umbral, pct)]
+```
+
+Está afuera de `Pet` por la misma razón que `_pids_darwin()`: es la única forma
+de auditar **cuándo** se corta sin levantar Qt y sin matar nada.
+`tests/test_kill_windows.py` la cubre con 15 tests.
+
+**Tres decisiones que no son obvias leyendo el código:**
+
+1. **97, no 95.** Los dos cortes no cuestan lo mismo si se disparan de más: la
+   ventana de 5h se destraba en horas, la semanal puede tardar 7 días.
+
+2. **Un solo corte por ventana semanal**, heredado de `AlertEngine` y acá
+   deliberado, no accidental. Si cortara en cada poll, cruzar el 97% dejaría
+   la máquina sin Claude Code hasta el reset — y como el corte se lleva puesta
+   la sesión de terminal, no habría dónde apagar la opción. Un corte, el aviso
+   en pantalla completa, y después es decisión del usuario.
+   `test_semanal_corta_una_sola_vez_por_ventana` lo fija.
+
+3. **Un solo corte por tick aunque crucen las dos ventanas.** `tick()` dispara
+   `cortes[-1]`; el segundo corte no encontraría nada vivo y anunciaría "no
+   había sesiones", que es peor que no decir nada. `engine.check()` ya marcó
+   los dos umbrales, así que ninguno queda pendiente para el tick siguiente.
+   `KILL_WINDOWS` deja la semanal al final justamente porque es la que el
+   usuario tiene que leer.
+
+`Pet.kill_result` pasó de `Signal(int, float)` a `Signal(int, float, str)`: la
+etiqueta viaja hasta `_on_kill_result()` porque los dos cortes se ven idénticos
+en pantalla y no significan lo mismo.
+
+**Verificado en vivo, no solo en tests**: `usage.json` con la semanal al 98 →
+`tick()` → las tres pantallas en orden (ALARMA del aviso semanal al 95,
+CORTANDO, CORTADO), `fired.json` con `seven_day:95:...` y
+`seven_day_kill:97:...` como claves separadas, y el tick siguiente sin volver a
+cortar. El kill real estaba reemplazado por un stub: no murió ningún proceso.
 
 ## Alertas y semáforo rediseñados (25/8, tarde)
 

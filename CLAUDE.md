@@ -425,7 +425,8 @@ kill_events(engine, cfg, state) -> [(etiqueta, umbral, pct)]
 
 Está afuera de `Pet` por la misma razón que `_pids_darwin()`: es la única forma
 de auditar **cuándo** se corta sin levantar Qt y sin matar nada.
-`tests/test_kill_windows.py` la cubre con 15 tests.
+`tests/test_kill_windows.py` cubre `kill_events()` y `seven_day_reminder()` con
+29 tests.
 
 **Tres decisiones que no son obvias leyendo el código:**
 
@@ -450,11 +451,40 @@ de auditar **cuándo** se corta sin levantar Qt y sin matar nada.
 etiqueta viaja hasta `_on_kill_result()` porque los dos cortes se ven idénticos
 en pantalla y no significan lo mismo.
 
-**Verificado en vivo, no solo en tests**: `usage.json` con la semanal al 98 →
-`tick()` → las tres pantallas en orden (ALARMA del aviso semanal al 95,
-CORTANDO, CORTADO), `fired.json` con `seven_day:95:...` y
-`seven_day_kill:97:...` como claves separadas, y el tick siguiente sin volver a
-cortar. El kill real estaba reemplazado por un stub: no murió ningún proceso.
+**El recordatorio es la otra mitad del punto 2.** Cortar una sola vez sería
+quedarse mudo por días justo cuando peor está la cuenta, así que
+`seven_day_reminder()` (misma forma que `kill_events()`: función de módulo,
+testeable sin Qt) devuelve el % si toca recordar, o `None`. `tick()` lo llama
+en el `else` del corte — nunca los dos en el mismo tick — y
+`_fire_seven_day_reminder()` abre la pantalla completa en **violeta**
+(`MOODS["credit"]`), no en rojo: hasta acá todo pantallazo rojo significó "algo
+acaba de pasar", y este no hace nada. El usuario lo va a ver varias veces
+durante días; distinguirlo de un corte de un vistazo importa.
+
+Dos decisiones del recordatorio:
+
+- **Se ancla a `seven_day_kill_threshold`**, no tiene umbral propio. Dos
+  números para la misma línea de peligro se desincronizan.
+- **No mira `auto_kill_enabled`.** Apagar el corte apaga el corte, no la
+  información. `test_no_depende_de_auto_kill` lo fija.
+
+`Pet.recordatorio_at` arranca en `0.0` a propósito (avisa en el primer tick si
+ya estás pasado) y vive en memoria, no en disco: un reinicio re-avisando es
+correcto, y persistirlo sería un archivo más que puede quedar viejo.
+
+**Verificado en vivo, no solo en tests** (con `_kill_claude_code_processes`
+reemplazado por un stub — no murió ningún proceso), cuatro ticks seguidos sobre
+`usage.json` con la semanal al 98:
+
+| tick | | resultado |
+|---|---|---|
+| 1 | cruza el 97% | aviso semanal del 95 + CORTANDO + CORTADO, los tres rojos |
+| 2 | 1s después | silencio |
+| 3 | +1h (reloj adelantado a mano) | SEMANA AL LIMITE, violeta, **sin** volver a matar |
+| 4 | 1s después | silencio |
+
+El kill se llamó exactamente **una** vez, y `fired.json` quedó con
+`seven_day:95:...` y `seven_day_kill:97:...` como claves separadas.
 
 ## Alertas y semáforo rediseñados (25/8, tarde)
 

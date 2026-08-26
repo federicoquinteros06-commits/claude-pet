@@ -134,3 +134,81 @@ def test_auto_kill_apagado_no_quema_los_umbrales(pet):
 
 def test_config_por_defecto_trae_el_umbral_semanal(pet):
     assert claude_pet.DEFAULT_CONFIG["seven_day_kill_threshold"] == 97
+
+
+# ============================================ recordatorio de la semanal
+# El corte semanal es UNO por ventana. Como el % semanal no baja hasta el
+# reset (dias despues), sin esto la mascota se queda muda justo cuando peor
+# esta la cuenta. seven_day_reminder() es lo que llena ese hueco.
+
+HORA = 3600
+
+
+def recordatorio(cfg=None, seven=98, ultimo=0.0, ahora=HORA):
+    return claude_pet.seven_day_reminder(
+        cfg or {}, estado(seven=seven), ultimo, ahora)
+
+
+def test_arriba_del_umbral_recuerda(pet):
+    assert recordatorio(seven=98) == 98
+
+
+def test_debajo_del_umbral_no_recuerda(pet):
+    assert recordatorio(seven=96) is None
+
+
+def test_justo_en_el_umbral_recuerda(pet):
+    assert recordatorio(seven=97) == 97
+
+
+def test_antes_del_intervalo_no_repite(pet):
+    assert recordatorio(seven=99, ultimo=0.0, ahora=HORA - 1) is None
+
+
+def test_cumplido_el_intervalo_repite(pet):
+    assert recordatorio(seven=99, ultimo=0.0, ahora=HORA) == 99
+
+
+def test_intervalo_configurable(pet):
+    cfg = {"seven_day_reminder_minutes": 15}
+    assert recordatorio(cfg, ultimo=0.0, ahora=15 * 60 - 1) is None
+    assert recordatorio(cfg, ultimo=0.0, ahora=15 * 60) == 98
+
+
+def test_cero_lo_apaga(pet):
+    assert recordatorio({"seven_day_reminder_minutes": 0}) is None
+
+
+def test_none_lo_apaga(pet):
+    assert recordatorio({"seven_day_reminder_minutes": None}) is None
+
+
+def test_sin_umbral_de_corte_no_hay_que_recordar(pet):
+    """Se ancla a seven_day_kill_threshold: sin linea de peligro no hay nada
+    que recordar, y tener un segundo numero para lo mismo se desincroniza."""
+    assert recordatorio({"seven_day_kill_threshold": None}) is None
+
+
+def test_sigue_el_umbral_de_corte_que_se_configure(pet):
+    cfg = {"seven_day_kill_threshold": 80}
+    assert recordatorio(cfg, seven=85) == 85
+    assert recordatorio(cfg, seven=79) is None
+
+
+def test_sin_dato_semanal_no_recuerda(pet):
+    assert claude_pet.seven_day_reminder({}, estado(five=99), 0.0, HORA) is None
+
+
+def test_no_depende_de_auto_kill(pet):
+    """Apagar el corte apaga el corte, no la informacion."""
+    assert recordatorio({"auto_kill_enabled": False}, seven=99) == 99
+
+
+def test_al_arrancar_avisa_en_el_primer_tick(pet):
+    """recordatorio_at arranca en 0: si prendes la mascota ya pasado el
+    umbral, te lo dice ya, no dentro de una hora."""
+    assert recordatorio(seven=99, ultimo=0.0, ahora=1e9) == 99
+
+
+def test_config_por_defecto_trae_el_intervalo(pet):
+    assert claude_pet.DEFAULT_CONFIG["seven_day_reminder_minutes"] == 60

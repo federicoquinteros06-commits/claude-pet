@@ -289,6 +289,7 @@ se corta con `muted` — el respaldo para cuando no estas mirando la mascota.
 | `auto_kill_enabled` | `true` | interruptor maestro del corte automatico: apagado, no corta por ninguna ventana |
 | `kill_threshold` | `95` | corte por la ventana de 5h, ver abajo |
 | `seven_day_kill_threshold` | `97` | corte por la ventana semanal; `null` lo apaga sin tocar el de 5h |
+| `seven_day_reminder_minutes` | `60` | cada cuanto recordar que la semanal sigue pasada, sin cortar; `0` lo apaga |
 | `scale` | `1.0` | tamaño del widget |
 | `usage_poller_enabled` | `true` | consulta `/api/oauth/usage`; anda sin TUI |
 | `usage_poll_seconds` | `140` | cada cuanto consulta. **No bajarlo**, ver abajo |
@@ -327,7 +328,8 @@ en vez de avisar que no sabia nada.
 | 5h | 95%+ (`kill_threshold`) | **no** | si | si |
 | semanal | 85% (`seven_day_thresholds[0]`) | si | no | no |
 | semanal | 95% (`seven_day_thresholds[1:]`) | si | si | no |
-| semanal | 97%+ (`seven_day_kill_threshold`) | **no** | si | si |
+| semanal | 97%+ (`seven_day_kill_threshold`) | **no** | si (rojo) | si, una vez |
+| semanal | 97%+, cada 60 min (`seven_day_reminder_minutes`) | **no** | si (violeta) | no |
 
 En los dos cortes el sonido y la notificacion se apagan a proposito: a esa
 altura ya sonaron todos los avisos previos de esa ventana, y la unica alerta
@@ -394,6 +396,25 @@ hasta que esa ventana resetee. Es deliberado, y pesa sobre todo en la semanal
 — un corte que se repitiera en cada poll te dejaria sin Claude Code por dias,
 sin poder abrir ni una terminal para apagar la opcion.
 
+**Pero no se queda muda.** El % semanal no baja hasta el reset, que puede caer
+dias despues, asi que despues del corte la mascota sigue recordandotelo cada
+60 minutos (`seven_day_reminder_minutes`) con una pantalla completa **violeta**
+— distinta del rojo de los cortes justamente para que se lea de un vistazo que
+esta no mata nada:
+
+```
+lun 15:00  97%  →  🔴 mata todo + "CORTADO"
+lun 15:05  reabris   →  anda normal
+lun 16:00  98%  →  🟣 "SEMANA AL LIMITE · no vuelve a cortar · resetea en 6d21h"
+mar        99%  →  🟣 recordatorio
+mie 09:00  resetea la semana  →  el corte se re-arma
+```
+
+El recordatorio **no** depende de `auto_kill_enabled`: apagar el corte apaga el
+corte, no la informacion. Se ancla al mismo `seven_day_kill_threshold` en vez
+de tener umbral propio, para que no haya dos numeros que se desincronicen.
+`0` lo apaga.
+
 **Que NO toca.** Solo el proceso del agente de Claude Code — el que
 efectivamente consume la ventana de 5h. VS Code, la terminal que lo lanzo, y
 la app de escritorio de Claude siguen abiertos: la ventana/pestaña donde
@@ -435,8 +456,9 @@ o via un agente en la nube, el corte automatico no llega ahi — protege
 unicamente lo que corre localmente, donde vive la mascota.
 
 Config: `auto_kill_enabled` (`true` por defecto) es el interruptor maestro;
-`kill_threshold` (`95`) y `seven_day_kill_threshold` (`97`) son los umbrales.
-Para apagar todo, `auto_kill_enabled: false`; para apagar una sola ventana,
+`kill_threshold` (`95`) y `seven_day_kill_threshold` (`97`) son los umbrales;
+`seven_day_reminder_minutes` (`60`) es el recordatorio de arriba. Para apagar
+todos los cortes, `auto_kill_enabled: false`; para apagar una sola ventana,
 `null` en su umbral.
 
 ---

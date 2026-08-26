@@ -76,6 +76,11 @@ DEFAULT_CONFIG = {
     # puede tardar dias. Dispara UNA sola vez por ventana semanal (ver
     # kill_events). None apaga este corte sin tocar el de 5h.
     "seven_day_kill_threshold": 97,
+    # Cada cuantos minutos recordar, en pantalla completa y SIN cortar nada,
+    # que la semanal sigue arriba de `seven_day_kill_threshold`. Existe porque
+    # el corte semanal es uno solo por ventana: sin esto la mascota se queda
+    # muda por dias justo cuando peor esta. 0 o None lo apaga.
+    "seven_day_reminder_minutes": 60,
     "scale": 1.0,
     "usage_poller_enabled": True,   # consulta /api/oauth/usage; anda sin TUI
     "usage_poll_seconds": 140,  # ver DEFAULT_POLL_SECONDS en claude_pet_usage
@@ -598,6 +603,37 @@ def kill_events(engine: "AlertEngine", cfg: dict, state: dict) -> list:
     return out
 
 
+def seven_day_reminder(cfg: dict, state: dict, ultimo: float,
+                       ahora: float):
+    """% semanal si toca recordatorio, o None.
+
+    El corte semanal dispara UNA sola vez por ventana (ver kill_events): es un
+    freno, no un bloqueo. Pero el % semanal no baja hasta el reset, que puede
+    caer dias despues, asi que sin esto la mascota se queda callada justo
+    cuando peor esta la cuenta. Este recordatorio llena ese hueco sin volver a
+    matar nada.
+
+    Se ancla a `seven_day_kill_threshold` en vez de tener umbral propio: la
+    linea de peligro ya esta definida ahi y dos numeros para lo mismo se
+    desincronizan. Si ese umbral es None no hay linea, y no hay que recordar.
+
+    NO depende de `auto_kill_enabled`: apagar el corte apaga el corte, no la
+    informacion. Estar arriba del 97% semanal se quiere saber igual.
+    """
+    cada = cfg.get("seven_day_reminder_minutes", 60)
+    if not cada:
+        return None
+    umbral = cfg.get("seven_day_kill_threshold", 97)
+    if umbral is None:
+        return None
+    pct = (state.get("seven_day") or {}).get("used_percentage")
+    if pct is None or pct < umbral:
+        return None
+    if ahora - ultimo < cada * 60:
+        return None
+    return pct
+
+
 # ============================================================ widget
 
 class AlertScreen(QtWidgets.QWidget):
@@ -687,6 +723,11 @@ class Pet(QtWidgets.QWidget):
         self.pulse = 0.0
         self.flash_until = 0.0
         self.drag_offset = None
+        # En 0 a proposito: si arrancas la mascota ya arriba del umbral
+        # semanal, el primer tick te lo dice en vez de esperar una hora. Vive
+        # en memoria y no en disco -- un reinicio re-avisando es correcto,
+        # y persistirlo solo agregaria un archivo mas que puede quedar viejo.
+        self.recordatorio_at = 0.0
         # 1.5x el intervalo de poll: por debajo de eso un dato "viejo"
         # es solo el lag normal entre consultas.
         self.stale_hint = max(STALE_HINT,
@@ -804,6 +845,7 @@ class Pet(QtWidgets.QWidget):
         for level, threshold, value, resets_at in events:
             self._fire(level, threshold, value, resets_at)
 
+        ahora = time.time()
         cortes = kill_events(self.engine, self.cfg, self.state)
         if cortes:
             # Un solo corte aunque crucen las dos ventanas en el mismo tick: el
@@ -813,6 +855,15 @@ class Pet(QtWidgets.QWidget):
             # deja la semanal al final justamente porque es la peor noticia.
             etiqueta, _umbral, value = cortes[-1]
             self._trigger_kill(value, etiqueta)
+            # el corte ya ocupo la pantalla completa: no encimar el
+            # recordatorio, y que el proximo caiga un intervalo despues.
+            self.recordatorio_at = ahora
+        else:
+            pct = seven_day_reminder(self.cfg, self.state,
+                                     self.recordatorio_at, ahora)
+            if pct is not None:
+                self.recordatorio_at = ahora
+                self._fire_seven_day_reminder(pct)
 
         # el detalle completo del fallo no entra en el widget: va al tooltip
         err = self.state.get("poller_error")
@@ -850,6 +901,31 @@ class Pet(QtWidgets.QWidget):
 
         self.flash_until = time.time() + (4 if level == "alarm" else 1.5)
         self._sync_anim()  # sin esto el flash esperaria hasta 1s al proximo tick
+
+    def _fire_seven_day_reminder(self, pct: float) -> None:
+        """Pantalla completa que NO corta: solo recuerda que la semanal sigue
+        pasada. Ni sonido ni notificacion, igual que los cortes.
+
+        Violeta (`credit`) y no rojo a proposito: hasta aca todo pantallazo
+        rojo significo "algo acaba de pasar" -- alarma del 90, corte. Este no
+        hace nada, y tiene que poder distinguirse de un corte de un vistazo,
+        porque el usuario lo va a ver varias veces durante dias.
+        """
+        if not self.cfg.get("fullscreen_alert_enabled", True):
+            return
+        resets_at = (self.state.get("seven_day") or {}).get("resets_at")
+        cuando = ""
+        if resets_at:
+            horas = max(0, int((resets_at - time.time()) // 3600))
+            # en dias cuando falta mucho: "resetea en 165h" obliga a dividir
+            # de cabeza, y la ventana semanal arranca justamente ahi.
+            cuando = (f" · resetea en {horas // 24}d{horas % 24:02d}h"
+                      if horas >= 48 else f" · resetea en {horas}h")
+        self.alert_screen.show_alert(
+            "SEMANA AL LIMITE",
+            f"{pct:.0f}% de la ventana semanal · ya se corto una vez en esta "
+            f"ventana, no vuelve a cortar{cuando}.",
+            MOODS["credit"][0])
 
     def _trigger_kill(self, value, etiqueta="de la ventana de 5h"):
         """Corte inmediato al cruzar un umbral de corte (95% de la ventana de

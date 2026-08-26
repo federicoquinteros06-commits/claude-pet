@@ -260,8 +260,29 @@ que es el remedio estandar de Qt en Unix.
 el runtime de ObjC via `ctypes`, sin arrastrar PyObjC. Es cosmetico: si falla,
 queda el icono y nada mas.
 
-**Sin verificar todavia**: como se comporta la pantalla completa contra
-Mission Control / Spaces, y si una app en fullscreen exclusivo la tapa.
+**La mascota desaparecia de la pantalla, y eran dos bugs.** El sintoma era
+"aparece a veces y despues no la veo mas". Medido sobre la ventana real:
+
+| | antes | despues |
+|---|---|---|
+| `hidesOnDeactivate` | `True` | `False` |
+| `collectionBehavior` | `258` (MoveToActiveSpace) | `257` (CanJoinAllSpaces + FullScreenAuxiliary) |
+| `level` | `8` | `25` (NSStatusWindowLevel) |
+
+1. **`Qt.Tool` se traduce a un NSPanel con `hidesOnDeactivate=YES`.** La
+   ventana se esconde sola cuando la app no es la activa — y la mascota
+   **nunca** es la activa, que es justamente el punto de usar `Qt.Tool` (no
+   robar foco). O sea que se ocultaba apenas tocabas cualquier otra ventana.
+
+2. **La ventana no cruzaba de Space.** El `258` era
+   `MoveToActiveSpace | FullScreenAuxiliary`: MoveToActiveSpace mueve la
+   ventana al Space activo *cuando la app se activa*, y esta app no se activa
+   nunca. Se quedaba donde nacio. Ademas el nivel 8 queda **por debajo** de
+   una app en pantalla completa.
+
+`_mac_keep_visible()` arregla los dos, y se aplica tambien a `AlertScreen`:
+ahi importa mas todavia, porque la pantalla completa es el unico canal que no
+se corta con `muted` — el respaldo para cuando no estas mirando la mascota.
 
 ---
 

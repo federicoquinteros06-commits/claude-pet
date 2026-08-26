@@ -589,6 +589,10 @@ class AlertScreen(QtWidgets.QWidget):
         self.label.setText(headline)
         self.detail.setText(detail)
         self.showFullScreen()
+        # Sin esto la alarma no aparece sobre una app en pantalla completa, que
+        # es JUSTO cuando mas se la necesita: es el unico canal que no se corta
+        # con `muted`, el respaldo para cuando no estas mirando la mascota.
+        _mac_keep_visible(self)
         self.raise_()
         self.activateWindow()
         self.setFocus()
@@ -986,19 +990,16 @@ class Pet(QtWidgets.QWidget):
         p.end()
 
 
-def _hide_dock_icon() -> None:
-    """NSApplicationActivationPolicyAccessory, o sea el LSUIElement de un
-    bundle, pero sin bundle.
+def _objc():
+    """Runtime de ObjC por ctypes, o None si no se puede.
 
-    La mascota es un overlay que vive en la barra de menu: no tiene por que
-    ocupar un lugar en el Dock ni aparecer en Cmd+Tab. PySide6 no expone
-    setActivationPolicy:, asi que se lo manda por el runtime de ObjC via
-    ctypes — que ya viene en la stdlib, a diferencia de PyObjC.
-
-    Puramente cosmetico: si falla, queda el icono y nada mas.
+    Se usa para tres cosas que PySide6 no expone y que en un overlay de macOS
+    no son opcionales: sacar el icono del Dock, evitar que la ventana se
+    esconda sola, y que sobreviva a un cambio de Space. ctypes viene en la
+    stdlib; PyObjC seria una dependencia nueva solo para esto.
     """
     if sys.platform != "darwin":
-        return
+        return None
     try:
         import ctypes
         import ctypes.util
@@ -1008,19 +1009,105 @@ def _hide_dock_icon() -> None:
         objc.objc_getClass.argtypes = [ctypes.c_char_p]
         objc.sel_registerName.restype = ctypes.c_void_p
         objc.sel_registerName.argtypes = [ctypes.c_char_p]
-
-        # objc_msgSend es variadica: hay que redeclarar argtypes por firma, o
-        # en arm64 los argumentos se pasan por el registro equivocado.
         objc.objc_msgSend.restype = ctypes.c_void_p
-        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        app_cls = objc.objc_getClass(b"NSApplication")
-        shared = objc.objc_msgSend(app_cls,
-                                   objc.sel_registerName(b"sharedApplication"))
+        return objc, ctypes
+    except Exception:
+        return None
 
-        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                      ctypes.c_long]
-        objc.objc_msgSend(shared,
-                          objc.sel_registerName(b"setActivationPolicy:"), 1)
+
+def _msg(objc, ctypes, receptor, selector, arg=None, argtype=None):
+    """Un objc_msgSend con la firma bien declarada.
+
+    objc_msgSend es variadica: si no se redeclaran los argtypes en CADA
+    llamada, en arm64 los argumentos viajan por el registro equivocado y el
+    resultado es basura (o un crash). De ahi que esto no se pueda cachear.
+    """
+    if arg is None:
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        return objc.objc_msgSend(receptor, objc.sel_registerName(selector))
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, argtype]
+    return objc.objc_msgSend(receptor, objc.sel_registerName(selector), arg)
+
+
+def _hide_dock_icon() -> None:
+    """NSApplicationActivationPolicyAccessory, o sea el LSUIElement de un
+    bundle, pero sin bundle.
+
+    La mascota es un overlay que vive en la barra de menu: no tiene por que
+    ocupar un lugar en el Dock ni aparecer en Cmd+Tab.
+
+    Puramente cosmetico: si falla, queda el icono y nada mas.
+    """
+    got = _objc()
+    if not got:
+        return
+    objc, ctypes = got
+    try:
+        shared = _msg(objc, ctypes, objc.objc_getClass(b"NSApplication"),
+                      b"sharedApplication")
+        _msg(objc, ctypes, shared, b"setActivationPolicy:", 1, ctypes.c_long)
+    except Exception:
+        pass
+
+
+# NSWindowCollectionBehavior. Los dos que importan para un overlay:
+#   CanJoinAllSpaces    (1 << 0) la ventana se ve en TODOS los Spaces, no solo
+#                               en aquel donde se creo.
+#   FullScreenAuxiliary (1 << 8) puede flotar sobre una app en pantalla
+#                               completa (que en macOS es un Space propio).
+NS_ALL_SPACES = 1 << 0
+NS_FULLSCREEN_AUX = 1 << 8
+
+# NSStatusWindowLevel. WindowStaysOnTopHint deja la ventana en el nivel
+# flotante normal, que queda POR DEBAJO de una app en fullscreen. 25 es el
+# nivel de los items de la barra de menu, que es conceptualmente lo que la
+# mascota es.
+NS_STATUS_WINDOW_LEVEL = 25
+
+
+def _mac_keep_visible(widget) -> None:
+    """Que la mascota no desaparezca. Hay que arreglar DOS cosas distintas.
+
+    1. `Qt.Tool` en macOS se traduce a un NSPanel con hidesOnDeactivate=YES:
+       la ventana se esconde sola cuando la app no es la activa. Y la mascota
+       NUNCA es la activa — es justamente el punto de usar Qt.Tool, no robar
+       foco. O sea que el overlay se ocultaba apenas tocabas cualquier otra
+       ventana. Lo destraba Qt.WA_MacAlwaysShowToolWindow.
+
+    2. Aun visible, la ventana pertenece al Space donde se creo. Cambiar de
+       Space (o abrir una app en pantalla completa, que crea el suyo) la deja
+       atras. Eso se arregla con el collectionBehavior, y ademas hay que
+       subirle el nivel: WindowStaysOnTopHint flota sobre las ventanas
+       normales pero no sobre un Space en fullscreen.
+
+    Se llama DESPUES de show(): antes, winId() todavia no tiene NSView.
+    """
+    if sys.platform != "darwin":
+        return
+
+    # 1. el fix de Qt, que no necesita ObjC
+    try:
+        widget.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
+    except AttributeError:
+        pass  # nombre distinto en otra version de Qt: no es fatal
+
+    # 2. el fix de Spaces, que si
+    got = _objc()
+    if not got:
+        return
+    objc, ctypes = got
+    try:
+        view = ctypes.c_void_p(int(widget.winId()))
+        win = _msg(objc, ctypes, view, b"window")
+        if not win:
+            return
+        _msg(objc, ctypes, win, b"setCollectionBehavior:",
+             NS_ALL_SPACES | NS_FULLSCREEN_AUX, ctypes.c_ulong)
+        _msg(objc, ctypes, win, b"setLevel:",
+             NS_STATUS_WINDOW_LEVEL, ctypes.c_long)
+        # hidesOnDeactivate por las dudas: el atributo de Qt lo cubre, pero si
+        # esa constante no existiera en esta version de Qt, esto igual lo evita.
+        _msg(objc, ctypes, win, b"setHidesOnDeactivate:", 0, ctypes.c_bool)
     except Exception:
         pass
 
@@ -1073,6 +1160,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     pet = Pet(cfg)
     pet.show()
+    # despues de show(): antes, winId() todavia no tiene NSView detras
+    _mac_keep_visible(pet)
     sys.exit(app.exec())
 
 

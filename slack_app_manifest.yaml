@@ -1,0 +1,42 @@
+# Manifest de la app de Slack para Claude Pet.
+#
+# Uso: api.slack.com/apps -> Create New App -> From an app manifest ->
+# elegi tu workspace -> pega esto -> Create -> Install to Workspace.
+# Sale con los scopes ya puestos; no hay que tildar nada a mano.
+#
+# Por que cada scope:
+#   chat:write        postea el mensaje. Sin esto no hay alerta.
+#   im:write          abre el DM con vos. Sin esto igual funciona (la mascota
+#                     detecta el missing_scope y postea al member ID directo),
+#                     pero es el camino documentado.
+#   users:read        lista miembros, para que slack_setup.py encuentre tu
+#                     member ID solo y no tengas que copiarlo del perfil.
+#   users:read.email  match por email en esa busqueda. Es lo unico que
+#                     distingue tu cuenta de un homonimo.
+#
+# Los dos ultimos son solo para el setup. Si preferis darle lo minimo, borralos
+# y pasale tu member ID a mano: slack_setup.py --target U0123ABCD
+
+display_information:
+  name: Claude Pet
+  description: Avisos de uso de la ventana de 5h de Claude Code
+  background_color: "#D97757"
+
+features:
+  bot_user:
+    display_name: Claude Pet
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:write
+      - users:read
+      - users:read.email
+
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
+  is_hosted: false

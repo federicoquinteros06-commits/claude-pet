@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Claude Code: settings.json es del proyecto (se versiona), settings.local.json
+# es personal de cada quien -- convencion estandar de Claude Code.
+.claude/settings.local.json
+
+# Estado en disco de la mascota (config con tokens, posicion de ventana,
+# sesiones, dedupe de alertas). Nada de esto vive en el repo: se genera en
+# ~/.claude/pet/ en runtime, fuera de este directorio. Esta entrada es por
+# si alguna vez alguien corre la mascota apuntando PET_DIR aca adentro.
+/config.json
+/fired.json
+/position.json
+/usage.json
+/poller_state.json
+/last_raw.json
+/sessions/
+
+# Editores / SO
+.DS_Store
+Thumbs.db

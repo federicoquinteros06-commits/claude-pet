@@ -271,6 +271,38 @@ información que se necesita a las apuradas.
 Corre en un hilo daemon porque **las dos** APIs son sincrónicas
 (`winsound.Beep()` y `afplay` por igual) y bloquearían el tick de 1s de Qt.
 
+## La animación se pausa por debajo del 50% (26/8)
+
+`_sync_anim()` apaga el timer de 50ms cuando `mood == "calm"`, y lo prende de
+vuelta en cualquier otro estado o durante un flash. Se llama desde `tick()` y
+desde `_fire()` (este último para que el flash arranque al instante y no
+espere hasta un segundo).
+
+**El motivo principal no es la batería, es el jitter.** `_animate` solo llama
+a `update()` en alarm/credit/flash, así que en calm el único repintado era el
+del tick de 1s — y para entonces `pulse` ya había avanzado 20 pasos
+(`0.12 * 20 = 2.4 rad`, ~137°). O sea que el logo pegaba un saltito de tamaño
+por segundo, al azar, en vez de respirar. Al pausar se fija `pulse = 0.0`
+(`sin(0) = 0` → `breathe = 1.0`, el tamaño de reposo) y se hace un último
+`update()`.
+
+**El ahorro de CPU es real pero chico**, medido sobre 20s aislando el timer:
+
+| | corriendo | pausado |
+|---|---|---|
+| despertadas | 407 | 0 |
+| CPU | 0.202s | 0.148s (−27%) |
+| context switches | 433 | 227 (−48%) |
+| % de un core | 0.99% | 0.75% |
+
+O sea ~0.24 puntos de un core. No se nota en la batería; no vender esto como
+si se notara.
+
+**Por qué solo calm y no también watch/warn**, que tampoco dibujan: decisión
+explícita del 26/8 — del 50% para arriba se prefiere no tocar nada. El
+`_anim_en_pausa()` está escrito para que ampliar el criterio sea cambiar una
+condición, si algún día se quiere.
+
 ## AlertScreen: pantalla completa en alarmas (25/8), verificada en vivo
 
 Ante el pedido explícito de un canal que no dependa de ver el toast ni de

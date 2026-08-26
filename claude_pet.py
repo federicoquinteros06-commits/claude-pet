@@ -61,15 +61,33 @@ DEFAULT_CONFIG = {
     "warn_thresholds": [25, 50, 75, 85],
     "alarm_thresholds": [90],
     "watch_seven_day": True,          # tambien alertar sobre la ventana semanal
+    # TODOS avisos (notif + sonido), ninguno abre pantalla completa: la semanal
+    # se reserva la pantalla para los cortes, que son violetas. Distinto de
+    # warn/alarm_thresholds, donde el segundo grupo si es alarma.
     "seven_day_thresholds": [85, 95],
     "muted": False,
     # Pantalla completa en la alarma (90%). Deliberadamente NO depende de
     # `muted`: es el canal para cuando el resto esta silenciado.
     "fullscreen_alert_enabled": True,
     # Corte automatico: mata los procesos de Claude Code (no VS Code, no la
-    # terminal, no la app de escritorio) al cruzar `kill_threshold`.
+    # terminal, no la app de escritorio) al cruzar cualquiera de los dos
+    # umbrales de abajo. Es el interruptor maestro: apagado, no corta nunca.
     "auto_kill_enabled": True,
     "kill_threshold": 95,
+    # Segunda red, sobre la ventana semanal. Mas alto que el 95 de la de 5h
+    # porque equivocarse cuesta mas: la de 5h vuelve en horas, la semanal
+    # puede tardar dias. Dispara UNA sola vez por ventana semanal (ver
+    # kill_events). None apaga este corte sin tocar el de 5h.
+    "seven_day_kill_threshold": 98,
+    # A partir de aca el corte deja de ser un aviso fuerte y pasa a ser un
+    # freno: se repite cada `usage_poll_seconds` mientras la semanal siga ahi,
+    # a pedido explicito ("por si se me escapa algo"). None lo apaga.
+    "seven_day_hard_kill_threshold": 100,
+    # Cada cuantos minutos recordar, en pantalla completa y SIN cortar nada,
+    # que la semanal sigue arriba de `seven_day_kill_threshold`. Existe porque
+    # el corte semanal es uno solo por ventana: sin esto la mascota se queda
+    # muda por dias justo cuando peor esta. 0 o None lo apaga.
+    "seven_day_reminder_minutes": 60,
     "scale": 1.0,
     "usage_poller_enabled": True,   # consulta /api/oauth/usage; anda sin TUI
     "usage_poll_seconds": 140,  # ver DEFAULT_POLL_SECONDS en claude_pet_usage
@@ -554,6 +572,133 @@ class AlertEngine:
         return out
 
 
+WINDOW_UI = {
+    # ventana -> (titulo de la notificacion, como se nombra en el cuerpo,
+    #             mood del que sale el color de la pantalla completa)
+    #
+    # Las dos ventanas se avisan y se cortan igual de fuerte, pero no
+    # significan lo mismo: la de 5h se destraba en horas, la semanal puede
+    # tardar 7 dias. Si comparten titulo y color son indistinguibles de un
+    # vistazo, que es justo como se leen las notificaciones. De ahi el
+    # "· 5h" / "· semana" en el titulo y el violeta en vez del rojo.
+    "five_hour": ("Claude Code · 5h", "de la ventana de 5h", "alarm"),
+    "seven_day": ("Claude Code · semana", "de la ventana semanal", "credit"),
+}
+
+KILL_WINDOWS = (
+    # (ventana, clave en config, umbral por defecto)
+    ("five_hour", "kill_threshold", 95),
+    ("seven_day", "seven_day_kill_threshold", 98),
+)
+
+
+def _falta(resets_at) -> str:
+    """" · resetea en ..." listo para concatenar, o "" si no hay dato.
+
+    En dias cuando faltan mas de 48h: la semanal resetea a ~165h de distancia
+    y "165h00m" obliga a dividir de cabeza.
+    """
+    if not resets_at:
+        return ""
+    secs = max(0, int(resets_at - time.time()))
+    if secs >= 48 * 3600:
+        return f" · resetea en {secs // 86400}d{(secs % 86400) // 3600:02d}h"
+    mins = secs // 60
+    return f" · resetea en {mins // 60}h{mins % 60:02d}m"
+
+
+def kill_events(engine: "AlertEngine", cfg: dict, state: dict) -> list:
+    """Umbrales de corte recien cruzados, mirando las DOS ventanas.
+
+    Devuelve [(ventana, umbral, pct)] en el orden de KILL_WINDOWS.
+
+    Vive afuera de Pet.tick() para poder testear la decision de cortar sin
+    levantar Qt ni matar nada -- misma razon que _pids_darwin().
+
+    Estos cortes dedupean: uno por ventana, igual que todo lo que pasa por
+    AlertEngine. Es deliberado -- si el corte semanal se repitiera en cada
+    poll, cruzar el 98% dejaria la maquina sin Claude Code por dias y ni
+    siquiera se podria abrir una terminal para apagar la opcion. El corte que
+    SI se repite es el otro, arriba del 100%: ver hard_kill_due().
+    """
+    if not cfg.get("auto_kill_enabled", True):
+        return []
+
+    out = []
+    for ventana, cfg_key, default in KILL_WINDOWS:
+        umbral = cfg.get(cfg_key, default)
+        if umbral is None:
+            continue
+        # namespace propio ("<ventana>_kill") para que este dedupe no comparta
+        # claves con warn_thresholds/seven_day_thresholds: son eventos
+        # independientes aunque miren la misma ventana.
+        for _lvl, t, pct, _resets in engine.check(
+                f"{ventana}_kill", state.get(ventana), [], [umbral]):
+            out.append((ventana, t, pct))
+    return out
+
+
+def hard_kill_due(cfg: dict, state: dict, ultimo: float, ahora: float):
+    """% semanal si toca un corte REPETIDO, o None.
+
+    Arriba de `seven_day_hard_kill_threshold` (100 por defecto) el corte deja
+    de ser "un freno y despues decidis vos" y pasa a repetirse cada
+    `usage_poll_seconds` mientras la semanal siga ahi. A pedido explicito:
+    a esa altura ya no queda margen que administrar, y el punto es que no se
+    escape nada corriendo en segundo plano.
+
+    Se ancla a `usage_poll_seconds` y no a un intervalo propio porque no tiene
+    sentido cortar mas seguido de lo que el dato se refresca: entre polls el %
+    es el mismo numero viejo.
+    """
+    if not cfg.get("auto_kill_enabled", True):
+        return None
+    umbral = cfg.get("seven_day_hard_kill_threshold", 100)
+    if umbral is None:
+        return None
+    pct = (state.get("seven_day") or {}).get("used_percentage")
+    if pct is None or pct < umbral:
+        return None
+    cada = max(1, int(cfg.get("usage_poll_seconds", 140)))
+    if ahora - ultimo < cada:
+        return None
+    return pct
+
+
+def seven_day_reminder(cfg: dict, state: dict, ultimo: float,
+                       ahora: float):
+    """% semanal si toca recordatorio, o None.
+
+    El corte semanal dispara UNA sola vez por ventana (ver kill_events): es un
+    freno, no un bloqueo. Pero el % semanal no baja hasta el reset, que puede
+    caer dias despues, asi que sin esto la mascota se queda callada justo
+    cuando peor esta la cuenta. Este recordatorio llena ese hueco sin volver a
+    matar nada.
+
+    Se ancla a `seven_day_kill_threshold` en vez de tener umbral propio: la
+    linea de peligro ya esta definida ahi y dos numeros para lo mismo se
+    desincronizan. Si ese umbral es None no hay linea, y no hay que recordar.
+
+    Arriba del 100% no llega a correr: ahi manda hard_kill_due(), que corta de
+    verdad en cada poll y ya ocupa la pantalla completa.
+
+    NO depende de `auto_kill_enabled`: apagar el corte apaga el corte, no la
+    informacion. Estar arriba del 97% semanal se quiere saber igual.
+    """
+    cada = cfg.get("seven_day_reminder_minutes", 60)
+    if not cada:
+        return None
+    umbral = cfg.get("seven_day_kill_threshold", 97)
+    if umbral is None:
+        return None
+    pct = (state.get("seven_day") or {}).get("used_percentage")
+    if pct is None or pct < umbral:
+        return None
+    if ahora - ultimo < cada * 60:
+        return None
+    return pct
+
+
 # ============================================================ widget
 
 class AlertScreen(QtWidgets.QWidget):
@@ -630,7 +775,7 @@ class Pet(QtWidgets.QWidget):
     # _kill_claude_code_processes corre en un hilo aparte (es un subprocess,
     # hasta 15s de timeout): esta signal es como su resultado vuelve al hilo
     # de Qt para poder tocar el tray/AlertScreen sin crashear.
-    kill_result = QtCore.Signal(int, float)
+    kill_result = QtCore.Signal(int, float, str, bool)
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -643,6 +788,13 @@ class Pet(QtWidgets.QWidget):
         self.pulse = 0.0
         self.flash_until = 0.0
         self.drag_offset = None
+        # En 0 a proposito: si arrancas la mascota ya arriba del umbral
+        # semanal, el primer tick te lo dice en vez de esperar una hora. Vive
+        # en memoria y no en disco -- un reinicio re-avisando es correcto,
+        # y persistirlo solo agregaria un archivo mas que puede quedar viejo.
+        self.recordatorio_at = 0.0
+        # idem: en 0 para que el primer tick corte si ya estas arriba del 100%
+        self.corte_duro_at = 0.0
         # 1.5x el intervalo de poll: por debajo de eso un dato "viejo"
         # es solo el lag normal entre consultas.
         self.stale_hint = max(STALE_HINT,
@@ -747,28 +899,50 @@ class Pet(QtWidgets.QWidget):
         self.mood = self._mood_for(pct)
         self._sync_anim()
 
-        events = self.engine.check(
+        events = [("five_hour",) + e for e in self.engine.check(
             "five_hour", five,
             self.cfg["warn_thresholds"], self.cfg["alarm_thresholds"],
-        )
+        )]
         if self.cfg.get("watch_seven_day"):
-            sd = self.cfg.get("seven_day_thresholds", [])
-            events += self.engine.check(
-                "seven_day", self.state.get("seven_day"), sd[:1], sd[1:]
-            )
+            # los umbrales semanales son TODOS avisos (warns), sin alarma: la
+            # semanal no abre pantalla completa por aviso, se la guarda para
+            # los cortes. Distinto de la de 5h, donde alarm_thresholds si abre.
+            events += [("seven_day",) + e for e in self.engine.check(
+                "seven_day", self.state.get("seven_day"),
+                self.cfg.get("seven_day_thresholds", []), []
+            )]
 
-        for level, threshold, value, resets_at in events:
-            self._fire(level, threshold, value, resets_at)
+        for ventana, level, threshold, value, resets_at in events:
+            self._fire(ventana, level, threshold, value, resets_at)
 
-        if self.cfg.get("auto_kill_enabled", True):
-            # namespace distinto ("five_hour_kill") para que este dedupe no
-            # comparta claves con warn_thresholds/alarm_thresholds: son
-            # eventos independientes aunque miren la misma ventana.
-            kill_events = self.engine.check(
-                "five_hour_kill", five, [], [self.cfg.get("kill_threshold", 95)]
-            )
-            for _level, _threshold, value, resets_at in kill_events:
-                self._trigger_kill(value)
+        ahora = time.time()
+        # kill_events() se llama SIEMPRE, aunque despues gane el corte duro:
+        # es lo que marca los umbrales como disparados. Saltearlo dejaria el
+        # corte del 98% pendiente para cuando la semanal vuelva a bajar.
+        cortes = kill_events(self.engine, self.cfg, self.state)
+        duro = hard_kill_due(self.cfg, self.state, self.corte_duro_at, ahora)
+
+        if duro is not None:
+            self.corte_duro_at = ahora
+            self.recordatorio_at = ahora
+            self._trigger_kill(duro, "seven_day", repite=True)
+        elif cortes:
+            # Un solo corte aunque crucen las dos ventanas en el mismo tick: el
+            # segundo no encontraria nada vivo y anunciaria "no habia sesiones".
+            # engine.check() ya marco los dos umbrales como disparados, asi que
+            # ninguno queda pendiente. Se anuncia el ultimo -- KILL_WINDOWS
+            # deja la semanal al final justamente porque es la peor noticia.
+            ventana, _umbral, value = cortes[-1]
+            self._trigger_kill(value, ventana)
+            # el corte ya ocupo la pantalla completa: no encimar el
+            # recordatorio, y que el proximo caiga un intervalo despues.
+            self.recordatorio_at = ahora
+        else:
+            pct = seven_day_reminder(self.cfg, self.state,
+                                     self.recordatorio_at, ahora)
+            if pct is not None:
+                self.recordatorio_at = ahora
+                self._fire_seven_day_reminder(pct)
 
         # el detalle completo del fallo no entra en el widget: va al tooltip
         err = self.state.get("poller_error")
@@ -780,67 +954,103 @@ class Pet(QtWidgets.QWidget):
 
         self.update()
 
-    def _fire(self, level, threshold, value, resets_at):
-        when = ""
-        if resets_at:
-            mins = max(0, int((resets_at - time.time()) // 60))
-            when = f" · resetea en {mins // 60}h{mins % 60:02d}m"
+    def _fire(self, ventana, level, threshold, value, resets_at):
+        titulo_notif, etiqueta, mood = WINDOW_UI[ventana]
+        when = _falta(resets_at)
 
         title = "ALARMA" if level == "alarm" else "Aviso"
-        body = f"{title} · uso de sesion {value:.0f}% (umbral {threshold}%){when}"
+        body = f"{title} · {value:.0f}% {etiqueta} (umbral {threshold}%){when}"
 
         # Pantalla completa: el unico canal que no se corta con `muted`, a
         # proposito. Es el respaldo para cuando el sonido esta silenciado, los
         # auriculares no estan puestos, o el usuario mira otro monitor.
         if level == "alarm" and self.cfg.get("fullscreen_alert_enabled", True):
             self.alert_screen.show_alert(
-                f"{value:.0f}%", body, MOODS["alarm"][0])
+                f"{value:.0f}%", body, MOODS[mood][0])
 
         if self.cfg.get("muted"):
             return
 
-        # Notificacion del SO
-        _notify(self.tray, "Claude Code", body)
+        # Notificacion del SO. El titulo dice de que ventana habla: en la
+        # bandeja de notificaciones es lo unico que se lee de reojo, y dos
+        # avisos que dicen "Claude Code · 87%" son indistinguibles.
+        _notify(self.tray, titulo_notif, body)
 
         _play_alert(level)
 
         self.flash_until = time.time() + (4 if level == "alarm" else 1.5)
         self._sync_anim()  # sin esto el flash esperaria hasta 1s al proximo tick
 
-    def _trigger_kill(self, value):
-        """Corte inmediato al cruzar `kill_threshold` (95% por defecto). Sin
-        cuenta regresiva ni forma de cancelar, a pedido explicito: mata los
-        procesos de Claude Code ya, no VS Code ni la terminal que los lanzo.
+    def _fire_seven_day_reminder(self, pct: float) -> None:
+        """Pantalla completa que NO corta: solo recuerda que la semanal sigue
+        pasada. Ni sonido ni notificacion, igual que los cortes.
+
+        Violeta (`credit`) y no rojo a proposito: hasta aca todo pantallazo
+        rojo significo "algo acaba de pasar" -- alarma del 90, corte. Este no
+        hace nada, y tiene que poder distinguirse de un corte de un vistazo,
+        porque el usuario lo va a ver varias veces durante dias.
+        """
+        if not self.cfg.get("fullscreen_alert_enabled", True):
+            return
+        cuando = _falta((self.state.get("seven_day") or {}).get("resets_at"))
+        _titulo, etiqueta, mood = WINDOW_UI["seven_day"]
+        self.alert_screen.show_alert(
+            "SEMANA AL LIMITE",
+            f"{pct:.0f}% {etiqueta} · ya se corto una vez en esta ventana, "
+            f"no vuelve a cortar{cuando}.",
+            MOODS[mood][0])
+
+    def _trigger_kill(self, value, ventana="five_hour", repite=False):
+        """Corte inmediato al cruzar un umbral de corte (95% de la ventana de
+        5h, 97% de la semanal). Sin cuenta regresiva ni forma de cancelar, a
+        pedido explicito: mata los procesos de Claude Code ya, no VS Code ni
+        la terminal que los lanzo.
 
         A esta altura NO suena ni notifica — a proposito. 25/50/75/85/90 ya
         avisaron con notif+sonido (90 con pantalla completa incluida); a
         95%+ la unica alerta que queda es la que corta de verdad, y sumar
-        sonido/toast encima no aporta nada."""
+        sonido/toast encima no aporta nada.
+
+        `ventana` decide el texto Y el color (ver WINDOW_UI): cortar por la
+        semanal y por la de 5h se verian identicos en pantalla, y no significan
+        lo mismo -- una se destraba en horas y la otra puede tardar una semana.
+
+        `repite` marca el corte duro del 100% semanal, que vuelve en cada poll:
+        cambia el mensaje final, porque "se cerraron 3 sesiones" a secas deja
+        creer que se puede volver a abrir."""
+        _titulo, etiqueta, mood = WINDOW_UI[ventana]
         self.alert_screen.show_alert(
-            "CORTANDO", f"{value:.0f}% de uso · cerrando las sesiones de "
-            "Claude Code...", MOODS["alarm"][0])
+            "CORTANDO", f"{value:.0f}% {etiqueta} · cerrando las sesiones de "
+            "Claude Code...", MOODS[mood][0])
 
         def _bg():
             n = _kill_claude_code_processes()
-            self.kill_result.emit(n, value)
+            self.kill_result.emit(n, value, ventana, repite)
 
         threading.Thread(target=_bg, daemon=True).start()
 
-    def _on_kill_result(self, n: int, value: float):
+    def _on_kill_result(self, n: int, value: float,
+                        ventana: str = "five_hour", repite: bool = False):
+        _titulo, etiqueta, mood = WINDOW_UI[ventana]
         if n < 0:
             headline, detail = "ATENCION", (
-                f"{value:.0f}% de uso · no se pudo confirmar el corte "
+                f"{value:.0f}% {etiqueta} · no se pudo confirmar el corte "
                 "automatico — revisalo a mano.")
         elif n == 0:
             headline, detail = "CORTE AUTOMATICO", (
-                f"{value:.0f}% de uso · no habia sesiones de Claude Code "
+                f"{value:.0f}% {etiqueta} · no habia sesiones de Claude Code "
                 "corriendo en esta maquina.")
         else:
-            plural = "es" if n != 1 else ""
+            # el verbo tambien concuerda: "se cerraron 1 sesion" se leia mal
+            verbo, plural = ("cerraron", "es") if n != 1 else ("cerro", "")
             headline, detail = "CORTADO", (
-                f"{value:.0f}% de uso · se cerraron {n} sesion{plural} de "
+                f"{value:.0f}% {etiqueta} · se {verbo} {n} sesion{plural} de "
                 "Claude Code.")
-        self.alert_screen.show_alert(headline, detail, MOODS["alarm"][0])
+        if repite:
+            cada = max(1, int(self.cfg.get("usage_poll_seconds", 140)))
+            detail += (f" Va a seguir cortando cada {cada}s mientras la "
+                       "semana siga en este nivel.")
+        self.alert_screen.show_alert(headline, detail, MOODS[mood][0])
 
     def _anim_en_pausa(self) -> bool:
         """Si conviene apagar la animacion del todo.

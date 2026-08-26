@@ -3,6 +3,8 @@
 Overlay always-on-top con el % de la ventana de 5h de Claude Code: avisos en
 25/50/75/85%, alarma con pantalla completa en 90%, y corte automatico de las
 sesiones de Claude Code en 95%+ — con notificacion nativa del SO y sonido.
+La ventana semanal tiene su propia escalera — avisos en 85/95%, corte en 98%,
+y corte repetido en 100% — con texto y color propios para no confundirlas.
 
 ```
 [ poller ]     GET /api/oauth/usage cada 140s, hilo dentro de la mascota
@@ -282,11 +284,14 @@ se corta con `muted` — el respaldo para cuando no estas mirando la mascota.
 | `warn_thresholds` | `[25, 50, 75, 85]` | avisos: notif + tono de 2 notas |
 | `alarm_thresholds` | `[90]` | alarma: notif + sirena + flash + pantalla completa |
 | `watch_seven_day` | `true` | tambien vigila la ventana semanal |
-| `seven_day_thresholds` | `[85, 95]` | primero = aviso, resto = alarma |
+| `seven_day_thresholds` | `[85, 95]` | avisos semanales: **todos** notif + sonido, ninguno abre pantalla completa |
 | `muted` | `false` | silencia sonido y notificacion (la pantalla completa NO se corta con esto) |
 | `fullscreen_alert_enabled` | `true` | pantalla completa en alarmas, ver abajo |
-| `auto_kill_enabled` | `true` | mata las sesiones de Claude Code al llegar a `kill_threshold` |
-| `kill_threshold` | `95` | umbral del corte automatico, ver abajo |
+| `auto_kill_enabled` | `true` | interruptor maestro del corte automatico: apagado, no corta por ninguna ventana |
+| `kill_threshold` | `95` | corte por la ventana de 5h, ver abajo |
+| `seven_day_kill_threshold` | `98` | corte por la ventana semanal, una vez; `null` lo apaga sin tocar el de 5h |
+| `seven_day_reminder_minutes` | `60` | cada cuanto recordar que la semanal sigue pasada, sin cortar; `0` lo apaga |
+| `seven_day_hard_kill_threshold` | `100` | de aca en mas corta **cada `usage_poll_seconds`**, no una sola vez; `null` lo apaga |
 | `scale` | `1.0` | tamaño del widget |
 | `usage_poller_enabled` | `true` | consulta `/api/oauth/usage`; anda sin TUI |
 | `usage_poll_seconds` | `140` | cada cuanto consulta. **No bajarlo**, ver abajo |
@@ -318,14 +323,34 @@ en vez de avisar que no sabia nada.
 
 ## Que hace cada umbral
 
-| uso | notif + sonido | pantalla completa | corte de sesiones |
-|---|---|---|---|
-| 25 / 50 / 75 / 85% | si | no | no |
-| 90% (`alarm_thresholds`) | si | si | no |
-| 95%+ (`kill_threshold`) | **no** | si | si |
+| ventana | uso | notif + sonido | pantalla completa | corte de sesiones |
+|---|---|---|---|---|
+| 5h | 25 / 50 / 75 / 85% (`warn_thresholds`) | si | no | no |
+| 5h | 90% (`alarm_thresholds`) | si | si | no |
+| 5h | 95%+ (`kill_threshold`) | **no** | si | si |
+| semanal | 85 / 95% (`seven_day_thresholds`) | si | no | no |
+| semanal | 98% (`seven_day_kill_threshold`) | **no** | si (violeta) | si, **una vez** |
+| semanal | 98–99%, cada 60 min (`seven_day_reminder_minutes`) | **no** | si (violeta) | no |
+| semanal | 100%+ (`seven_day_hard_kill_threshold`) | **no** | si (violeta) | si, **cada 140s** |
 
-A partir de 95% la unica alerta que queda es la que corta de verdad: sumar
-sonido o toast ahi no aporta nada, así que se apagan a proposito.
+En los dos cortes el sonido y la notificacion se apagan a proposito: a esa
+altura ya sonaron todos los avisos previos de esa ventana, y la unica alerta
+que falta es la que corta de verdad. Sumar un toast encima no aporta nada.
+
+Las dos ventanas se vigilan por separado y no se pisan: cruzar un umbral de
+aviso semanal no consume el corte semanal, ni al reves.
+
+**La semanal nunca abre una pantalla roja, y la de 5h nunca abre una violeta.**
+Es a proposito: los dos cortes se verian identicos compartiendo color, y no
+significan lo mismo — la de 5h se destraba en horas, la semanal puede tardar
+una semana. Lo mismo con las notificaciones, que llevan el titulo de su
+ventana (`Claude Code · 5h` / `Claude Code · semana`) porque en la bandeja del
+sistema el titulo es lo unico que se lee de reojo:
+
+```
+🔔 [Claude Code · 5h]      ALARMA · 90% de la ventana de 5h (umbral 90%) · resetea en 2h59m
+🔔 [Claude Code · semana]  Aviso · 95% de la ventana semanal (umbral 95%) · resetea en 6d21h
+```
 
 ## Alarma en pantalla completa
 
@@ -353,19 +378,67 @@ juegos, algunos reproductores de video) puede tapar cualquier ventana
 always-on-top, esta incluida. Para el uso normal (codigo, navegador, oficina)
 no es un problema.
 
-## Corte automatico: mata las sesiones de Claude Code al 95%
+## Corte automatico: mata las sesiones de Claude Code
 
 Pensado para cuando Claude esta trabajando en segundo plano (una tarea larga,
 un agente en background) y vos no estas mirando ninguna alerta — en una
-reunion, por ejemplo. Al cruzar `kill_threshold` (95% por defecto) en la
-ventana de 5h, la mascota:
+reunion, por ejemplo. Hay dos disparadores, uno por ventana:
+
+| ventana | umbral | config | corta | se destraba en |
+|---|---|---|---|---|
+| 5h | 95% | `kill_threshold` | una vez | horas |
+| semanal | 98% | `seven_day_kill_threshold` | una vez | hasta 7 dias |
+| semanal | 100% | `seven_day_hard_kill_threshold` | **cada 140s** | hasta 7 dias |
+
+Los umbrales semanales estan mas arriba justamente por la ultima columna:
+cortar de mas en la ventana de 5h se paga con una espera de horas, en la
+semanal podes quedarte sin Claude Code el resto de la semana.
+
+Al cruzar cualquiera de los dos, la mascota:
 
 1. Mata los procesos de Claude Code que esten corriendo en esta maquina —
    **inmediato, sin cuenta regresiva ni forma de cancelar**, a proposito.
 2. Muestra el resultado en la pantalla completa del monitor principal
-   ("CORTADO · se cerraron N sesiones de Claude Code"). **Sin sonido ni
-   notificacion del SO** — a esta altura ya sonaron cinco avisos antes (25,
-   50, 75, 85, 90%); la unica alerta que falta es la que corta de verdad.
+   ("CORTADO · 98% de la ventana semanal · se cerraron N sesiones"),
+   **diciendo cual ventana disparo**: los dos cortes se ven igual en pantalla
+   pero no significan lo mismo. **Sin sonido ni notificacion del SO** — a esta
+   altura ya sonaron todos los avisos de esa ventana; la unica alerta que
+   falta es la que corta de verdad.
+
+**Los cortes de 95% y 98% son uno solo por ventana.** Cruzar el umbral dispara
+un corte, no un bloqueo: si volves a abrir Claude Code, la mascota no te lo
+vuelve a cerrar hasta que esa ventana resetee. Un corte que se repitiera en
+cada poll te dejaria sin Claude Code por dias, sin poder abrir ni una terminal
+para apagar la opcion.
+
+**El de 100% si se repite**, cada `usage_poll_seconds` (140s), mientras la
+semanal siga ahi. A esa altura ya no queda margen que administrar y el punto
+es que no se escape nada corriendo en segundo plano. La pantalla lo dice:
+*"Va a seguir cortando cada 140s mientras la semana siga en este nivel."*
+Se ancla al intervalo de poll y no a uno propio porque entre consulta y
+consulta el % es el mismo numero viejo: cortar mas seguido no aporta nada.
+
+**Pero no se queda muda.** El % semanal no baja hasta el reset, que puede caer
+dias despues, asi que despues del corte la mascota sigue recordandotelo cada
+60 minutos (`seven_day_reminder_minutes`) con una pantalla completa **violeta**
+— distinta del rojo de los cortes justamente para que se lea de un vistazo que
+esta no mata nada:
+
+```
+lun 12:00  85%  →  🔔 aviso  [Claude Code · semana]
+lun 14:00  95%  →  🔔 aviso  [Claude Code · semana]
+lun 15:00  98%  →  🟣 mata todo + "CORTADO"
+lun 15:05  reabris   →  anda normal
+lun 16:00  98%  →  🟣 "SEMANA AL LIMITE · no vuelve a cortar · resetea en 6d21h"
+mar 10:00  99%  →  🟣 recordatorio
+mar 18:00  100% →  🟣 mata todo, y otra vez cada 140s mientras siga en 100
+mie 09:00  resetea la semana  →  todo se re-arma
+```
+
+El recordatorio **no** depende de `auto_kill_enabled`: apagar el corte apaga el
+corte, no la informacion. Se ancla al mismo `seven_day_kill_threshold` en vez
+de tener umbral propio, para que no haya dos numeros que se desincronicen.
+`0` lo apaga.
 
 **Que NO toca.** Solo el proceso del agente de Claude Code — el que
 efectivamente consume la ventana de 5h. VS Code, la terminal que lo lanzo, y
@@ -407,8 +480,12 @@ python3 -c "import claude_pet; print(claude_pet._pids_darwin())"
 o via un agente en la nube, el corte automatico no llega ahi — protege
 unicamente lo que corre localmente, donde vive la mascota.
 
-Config: `auto_kill_enabled` (`true` por defecto) y `kill_threshold` (`95`).
-Para apagarlo, `auto_kill_enabled: false`.
+Config: `auto_kill_enabled` (`true` por defecto) es el interruptor maestro;
+`kill_threshold` (`95`), `seven_day_kill_threshold` (`98`) y
+`seven_day_hard_kill_threshold` (`100`) son los umbrales;
+`seven_day_reminder_minutes` (`60`) es el recordatorio de arriba. Para apagar
+todos los cortes, `auto_kill_enabled: false`; para apagar uno solo, `null` en
+su umbral.
 
 ---
 

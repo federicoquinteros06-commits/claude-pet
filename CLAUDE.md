@@ -349,7 +349,8 @@ los procesos de Claude Code al cruzar `kill_threshold` (95% default,
 dedupe separado (`"five_hour_kill"`, vía `AlertEngine.check` reutilizado con
 `warns=[]`), y disparado por `Pet._trigger_kill()` → hilo daemon →
 `Pet.kill_result` signal → `_on_kill_result()` actualiza el `AlertScreen` ya
-abierto. A pedido explícito: **sin cuenta regresiva, sin cancelación** — el
+abierto. (El 26/8 se sumó un segundo disparador por la ventana semanal y la
+elección de namespace se movió a `kill_events()` — ver más abajo.) A pedido explícito: **sin cuenta regresiva, sin cancelación** — el
 usuario comparó las alternativas y prefirió corte inmediato una vez confirmado
 que solo mata el proceso `claude.exe`, no VS Code ni la terminal.
 
@@ -408,6 +409,91 @@ como "vivo" varios cientos de ms después de matarlo — caché de WMI. `Get-Pro
 (no-WMI) sí reflejaba el estado real al instante. La función de producción no
 tiene este problema porque cuenta sobre la colección `$p` ya capturada, nunca
 re-consulta después de matar.
+
+## La ventana semanal, escalera completa (26/8)
+
+Antes la semanal era un par de umbrales de aviso colgados del mismo código que
+la de 5h. Ahora tiene escalera propia, con corte, y **texto y color propios**:
+
+| semanal | qué pasa | dónde |
+|---|---|---|
+| 85 / 95% | aviso: notif + sonido, **sin** pantalla completa | `seven_day_thresholds`, todos `warn` |
+| 98% | pantallazo violeta + corte, **una vez** | `kill_events()` |
+| 98–99%, c/60 min | pantallazo violeta, sin cortar | `seven_day_reminder()` |
+| 100%+ | pantallazo violeta + corte **cada `usage_poll_seconds`** | `hard_kill_due()` |
+
+Las tres funciones de decisión (`kill_events`, `seven_day_reminder`,
+`hard_kill_due`) son de módulo, fuera de `Pet`, por la misma razón que
+`_pids_darwin()`: es la única forma de auditar **cuándo** se corta sin levantar
+Qt y sin matar nada. `tests/test_kill_windows.py` las cubre con 39 tests.
+
+### Rojo es la de 5h, violeta es la semanal
+
+`WINDOW_UI` es la única tabla que decide cómo se ve cada ventana:
+
+```python
+WINDOW_UI = {
+    "five_hour": ("Claude Code · 5h",     "de la ventana de 5h",    "alarm"),
+    "seven_day": ("Claude Code · semana", "de la ventana semanal",  "credit"),
+}
+```
+
+El motivo no es estético. Los dos cortes se veían **idénticos** —mismo rojo,
+mismo texto "uso de sesion N%", mismo título "Claude Code"— y no significan lo
+mismo: la de 5h se destraba en horas, la semanal puede tardar 7 días. En la
+bandeja de notificaciones el título es lo único que se lee de reojo, así que
+ahí va el `· 5h` / `· semana`.
+
+Efecto secundario: se arregló un texto que estaba mal desde antes. `_fire()`
+decía `"uso de sesion {pct}%"` para las **dos** ventanas, así que un aviso del
+95% semanal se anunciaba como si fuera de sesión.
+
+`_fire()` ahora recibe la ventana como primer parámetro; `tick()` se la
+antepone a lo que devuelve `AlertEngine.check()`, que quedó sin tocar.
+
+### El corte duro no dedupea, y es la excepción
+
+Todo lo demás pasa por `AlertEngine`, que dispara una vez por ventana. El corte
+del 100% no: `hard_kill_due()` es una función de tiempo, no de umbral cruzado,
+y se repite cada `usage_poll_seconds`. A pedido explícito — "por si se me
+escapa algo".
+
+Se ancla a `usage_poll_seconds` y no a un intervalo propio porque entre poll y
+poll el `%` es el mismo número viejo: cortar más seguido no aportaría nada.
+
+`tick()` llama a `kill_events()` **siempre**, aun cuando gane el corte duro, y
+recién después elige. Saltearlo dejaría el umbral del 98% sin marcar y por lo
+tanto pendiente para más tarde en la misma ventana.
+
+### Firma del resultado
+
+`Pet.kill_result` es `Signal(int, float, str, bool)`: n, pct, ventana, y si el
+corte se repite. El `bool` cambia el mensaje final — "se cerraron 3 sesiones" a
+secas deja creer que se puede volver a abrir, y arriba del 100% no.
+
+`Pet.recordatorio_at` y `Pet.corte_duro_at` arrancan en `0.0` a propósito
+(actúan en el primer tick si ya estás pasado) y viven en memoria, no en disco:
+un reinicio re-avisando es correcto, y persistirlos sería un archivo más que
+puede quedar viejo.
+
+### Verificado en vivo, no solo en tests
+
+Con `_kill_claude_code_processes` y `_play_alert` reemplazados por stubs (no
+murió ningún proceso), la escalera entera en una corrida:
+
+| semana | resultado |
+|---|---|
+| 85 | 🔔 `[Claude Code · semana]` aviso, sin pantalla |
+| 95 | 🔔 aviso, sin pantalla, sin corte |
+| 98 | 🟣 CORTANDO + CORTADO, 1 corte |
+| 98, +1s | silencio |
+| 98, +1h | 🟣 SEMANA AL LIMITE, **sin** cortar |
+| 100 | 🟣 CORTANDO + CORTADO + "va a seguir cortando cada 140s" |
+| 100, +1s | silencio |
+| 100, +140s | 🟣 corta otra vez |
+| 5h a 90 (control) | 🔴 pantallazo rojo con wording de 5h |
+
+4 cortes en total, exactamente donde correspondía.
 
 ## Alertas y semáforo rediseñados (25/8, tarde)
 

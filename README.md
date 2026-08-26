@@ -20,11 +20,11 @@ panel de VS Code** (el webview no tiene donde ejecutarlo), asi que si trabajas
 desde el panel el poller es lo unico que tenes. El collector sigue siendo el
 unico que aporta contexto% y costo por sesion.
 
-> **Este proyecto es Windows-only hoy.** Se desarrollo y probo enteramente en
-> Windows; el sonido, la pantalla completa y sobre todo el corte automatico de
-> sesiones usan APIs de Windows sin fallback multiplataforma. Si queres correrlo
-> en macOS o Linux, ver [PORTING.md](PORTING.md) — un analisis de que habria
-> que cambiar, no una implementacion lista.
+> **Windows y macOS.** Se desarrollo en Windows y se porto a macOS el
+> 25/8/2026, verificando cada pieza contra un Mac real (macOS 26.6.2, arm64):
+> credenciales, corte automatico, sonido, notificaciones e instancia unica.
+> Linux sigue sin portar — el corte automatico ahi es un no-op. Ver
+> [PORTING.md](PORTING.md) para el detalle de que cambio y por que.
 
 ---
 
@@ -59,6 +59,17 @@ cp claude_pet_collector.py claude_pet.py claude_pet_usage.py ~/.claude/pet/
 
 `claude_pet_slack.py`, `slack_setup.py` y `slack_app_manifest.yaml` no hacen
 falta para este paso — quedan en el repo como referencia (ver seccion 3).
+
+**macOS**: si el `python3` del sistema es viejo (en macOS 26 es 3.9.6, de
+CommandLineTools) conviene un venv aparte antes que instalar PySide6 encima:
+
+```bash
+uv venv --python 3.13 ~/.claude/pet/.venv
+uv pip install --python ~/.claude/pet/.venv PySide6
+mkdir -p ~/.claude/pet
+cp claude_pet_collector.py claude_pet.py claude_pet_usage.py ~/.claude/pet/
+~/.claude/pet/.venv/bin/python ~/.claude/pet/claude_pet.py
+```
 
 ## 2. Enganchar el collector como statusLine
 
@@ -149,10 +160,108 @@ Arrastrala con el mouse (guarda la posicion). Click derecho en el icono de
 bandeja: silenciar, abrir config, salir.
 
 Para que arranque sola:
-- **macOS**: `launchd` (`~/Library/LaunchAgents/claude-pet.plist`, `RunAtLoad`)
 - **Windows**: acceso directo a `pythonw claude_pet.py` en `shell:startup`
   (`pythonw` evita la ventana de consola)
 - **Linux**: `.desktop` en `~/.config/autostart/`
+- **macOS**: `launchd`. Guardar como
+  `~/Library/LaunchAgents/com.claudepet.overlay.plist` y cargar con
+  `launchctl load -w ~/Library/LaunchAgents/com.claudepet.overlay.plist`:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+    <key>Label</key><string>com.claudepet.overlay</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/TUUSUARIO/.claude/pet/.venv/bin/python</string>
+      <string>/Users/TUUSUARIO/.claude/pet/claude_pet.py</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+  </dict>
+  </plist>
+  ```
+
+  `launchd` no expande `~`: las rutas van absolutas. Y ojo con el Keychain —
+  si nunca le diste "Permitir siempre" desde una corrida manual, bajo
+  `launchd` no hay nadie para autorizar el dialogo.
+
+---
+
+## macOS: lo que es distinto
+
+Portado y verificado el 25/8/2026 contra macOS 26.6.2 (arm64). Todo lo de este
+README aplica igual salvo lo siguiente.
+
+**Las credenciales no estan en un archivo, estan en el Keychain.** En Windows
+y Linux el token OAuth vive en `~/.claude/.credentials.json`. En Mac ese
+archivo **no existe**: Claude Code guarda el mismo JSON en el Keychain del
+login, bajo el servicio `Claude Code-credentials`. `_creds()` en
+`claude_pet_usage.py` lo lee con `security find-generic-password -w`.
+
+Era el unico bloqueante real del port, y el mas silencioso: sin ese cambio
+`_token()` tira `FileNotFoundError` en cada poll, `usage.json` nunca se
+escribe, la mascota muestra `--` para siempre y **ningun umbral llega a
+dispararse** — el corte automatico incluido. Se ve igual que "todavia no
+llegaste al 25%".
+
+Si la primera lectura abre el dialogo del Keychain, dale **"Permitir
+siempre"**: bajo `launchd` no hay nadie para autorizarlo y el poller queda
+sin token.
+
+**El corte automatico mata las sesiones de terminal tambien.** En Windows el
+filtro es por ruta, porque `claude.exe` es un nombre ambiguo que comparte con
+la app de escritorio. En Mac el problema es el opuesto:
+
+| proceso | `ps -axo comm=` | corte |
+|---|---|---|
+| panel de VS Code | `.../native-binary/claude` | mata |
+| CLI nativo en terminal | `claude` | mata |
+| app de escritorio | `/Applications/Claude.app/Contents/MacOS/Claude` | **no toca** |
+| helpers de Electron | `Claude Helper (Renderer)` | **no toca** |
+
+El nombre no es ambiguo (`Claude` != `claude`), asi que alcanza con comparar
+el **basename, case-sensitive**. Y tiene que ser por basename y no por ruta,
+porque el CLI nativo (`~/.local/bin/claude`) sale **pelado** en `ps`: es un
+symlink y `ps` no lo resuelve. Un filtro por marcador de ruta como el de
+Windows dejaria vivas todas las sesiones de terminal, que queman la ventana
+de 5h igual que las del panel.
+
+Para auditar el filtro sin matar nada:
+
+```bash
+~/.claude/pet/.venv/bin/python -c "import claude_pet; print(claude_pet._pids_darwin())"
+```
+
+**Las notificaciones no salen por Qt.** `QSystemTrayIcon.showMessage()` en Mac
+pasa por `UNUserNotificationCenter`, que exige bundle identifier. Corriendo
+como `python claude_pet.py` no hay bundle (`lsappinfo` lo confirma:
+`bundleID=[ NULL ]`) y la notificacion **falla en silencio** — el peor modo de
+fallar para un canal de alerta. Por eso `_notify()` usa `osascript` en darwin.
+La primera vez puede pedir permiso en Ajustes del Sistema -> Notificaciones.
+
+**El sonido usa `afplay`.** No hay equivalente a `winsound.Beep(freq, ms)` en
+la stdlib, pero con los `.aiff` del sistema se conserva lo que importa: que
+aviso y alarma suenen **distinto**, no solo una cantidad distinta de veces del
+mismo beep. Ping+Glass para aviso, Sosumi x3 para alarma.
+
+**La instancia unica necesitaba un fix.** El comentario original decia que en
+Windows el SO libera el bloque de `QSharedMemory` al morir el proceso, asi que
+un crash no deja lock huerfano. En POSIX **no es asi**: el segmento sobrevive
+y `create()` fallaria para siempre — la mascota no volveria a arrancar nunca
+sin borrarlo a mano. `_single_instance_guard()` hace el `attach()`+`detach()`
+que es el remedio estandar de Qt en Unix.
+
+**Sin icono en el Dock.** `_hide_dock_icon()` pone
+`NSApplicationActivationPolicyAccessory` (el `LSUIElement` de un bundle) por
+el runtime de ObjC via `ctypes`, sin arrastrar PyObjC. Es cosmetico: si falla,
+queda el icono y nada mas.
+
+**Sin verificar todavia**: como se comporta la pantalla completa contra
+Mission Control / Spaces, y si una app en fullscreen exclusivo la tapa.
 
 ---
 
@@ -368,5 +477,7 @@ esta dimensionado para eso, no para monitoreo.
   fino (no interrumpe una escritura en curso), a costo de mas superficie de
   implementacion y de no cubrir una sesion ya bloqueada esperando una
   respuesta larga del modelo.
-- Portar el corte automatico y la pantalla completa a macOS/Linux (ver
-  `PORTING.md`): hoy son Windows-only.
+- ~~Portar el corte automatico y la pantalla completa a macOS/Linux.~~
+  **macOS hecho** (25/8/2026, ver `PORTING.md` y la seccion de macOS arriba).
+  Linux sigue pendiente: necesita la misma rama `ps`/`os.kill` que darwin,
+  pero con su propia verificacion de como se ve el CLI en `ps` ahi.

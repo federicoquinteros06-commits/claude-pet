@@ -16,6 +16,7 @@ Config:      ~/.claude/pet/config.json  (se crea solo la primera vez)
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -239,15 +240,34 @@ ALERT_TONES = {
 }
 
 
+# macOS no tiene equivalente a winsound.Beep(freq, ms) en la stdlib, pero si
+# trae `afplay` y un set de .aiff del sistema. Alcanza para conservar lo que
+# importa del diseno de Windows: que aviso y alarma suenen DISTINTO, no solo
+# una cantidad distinta de veces del mismo beep. Ping+Glass imita el timbre de
+# dos notas; Sosumi repetido hace de sirena.
+MAC_SOUNDS_DIR = "/System/Library/Sounds"
+MAC_SOUNDS = {
+    "warn":  ["Ping", "Glass"],
+    "alarm": ["Sosumi"] * 3,
+}
+
+
 def _play_alert(level: str) -> None:
     """Reproduce el patron de `level` en un hilo aparte.
 
     `winsound.Beep()` es sincronico: llamarlo en el hilo de Qt bloquearia el
     tick de 1s y la animacion de 50ms mientras dura la secuencia (hasta ~700ms
-    en la alarma). Sin winsound (mac/Linux) no hay forma de pedir un tono
-    propio sin arrastrar un backend de audio, asi que cae al beep generico de
-    Qt repetido — mismo patron de conteo que antes de este cambio.
+    en la alarma). `afplay` en macOS tambien es sincronico, asi que el hilo
+    daemon vale igual para las dos plataformas.
+
+    Ultimo recurso (Linux, o si afplay falla): el beep generico de Qt repetido,
+    donde aviso y alarma solo se distinguen por el conteo.
     """
+    def _qt_beep():
+        for _ in range(3 if level == "alarm" else 1):
+            QtWidgets.QApplication.beep()
+            time.sleep(0.22)
+
     def _run():
         if HAS_WINSOUND:
             for freq, dur in ALERT_TONES.get(level, ALERT_TONES["warn"]):
@@ -255,12 +275,51 @@ def _play_alert(level: str) -> None:
                     winsound.Beep(freq, dur)
                 except RuntimeError:
                     break  # ej. sin dispositivo de audio: no reintentar en loop
+        elif sys.platform == "darwin":
+            for nombre in MAC_SOUNDS.get(level, MAC_SOUNDS["warn"]):
+                try:
+                    subprocess.run(
+                        ["afplay", f"{MAC_SOUNDS_DIR}/{nombre}.aiff"],
+                        capture_output=True, timeout=5)
+                except Exception:
+                    _qt_beep()  # sin afplay o sin audio: que al menos suene algo
+                    break
         else:
-            for i in range(3 if level == "alarm" else 1):
-                QtWidgets.QApplication.beep()
-                time.sleep(0.22)
+            _qt_beep()
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _notify(tray, title: str, body: str) -> None:
+    """Notificacion nativa del SO.
+
+    En Windows/Linux es QSystemTrayIcon.showMessage() y listo. En macOS NO:
+    Qt rutea showMessage() por UNUserNotificationCenter, que exige que el
+    proceso tenga bundle identifier. Corriendo como `python claude_pet.py` no
+    hay bundle, [NSBundle mainBundle].bundleIdentifier es nil, y la
+    notificacion no aparece — fallando en SILENCIO, que es el peor modo de
+    fallar para un canal de alerta: parece que anda.
+
+    `osascript` no necesita bundle propio, asi que es la via que si llega.
+    """
+    if sys.platform == "darwin":
+        # Escapado manual: el body trae % y · y lo arma f-string, pero una
+        # comilla doble suelta romperia el script de AppleScript.
+        esc = lambda t: t.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{esc(body)}" with title "{esc(title)}"'],
+                capture_output=True, timeout=10)
+            return
+        except Exception:
+            pass  # cae al tray de Qt, que en el peor caso es un no-op
+
+    try:
+        tray.showMessage(title, body,
+                         QtWidgets.QSystemTrayIcon.Warning, 8000)
+    except Exception:
+        pass
 
 
 # Segmento de ruta EXCLUSIVO del binario nativo que lanza la extension de
@@ -272,6 +331,31 @@ def _play_alert(level: str) -> None:
 # procesos reales de esta maquina el 25/8/2026.
 CLAUDE_CODE_CLI_MARKER = "native-binary\\claude.exe"
 
+# En macOS el problema es EL OPUESTO al de Windows, y por eso el filtro es
+# otro. Aca el nombre NO es ambiguo: la app de escritorio corre como 'Claude'
+# (mayuscula), sus helpers de Electron como 'Claude Helper (Renderer)' y el
+# widget como 'ClaudeUsageWidgetExtension'. Ninguno es 'claude' exacto, asi
+# que un match case-sensitive sobre el basename los excluye a los tres solo,
+# sin necesidad del desempate por ruta que hizo falta en Windows.
+#
+# Y hace falta que sea por basename, no por ruta, porque las DOS formas de
+# correr Claude Code en un Mac se ven distinto en `ps -axo comm=`:
+#
+#   .../anthropic.claude-code-*/resources/native-binary/claude   <- panel VS Code
+#   claude                                                       <- CLI nativo
+#
+# El CLI nativo (~/.local/bin/claude -> ~/.local/share/claude/versions/X) sale
+# PELADO: ps no resuelve el symlink. Filtrar por marcador de ruta como en
+# Windows dejaria vivas todas las sesiones de terminal, que queman la ventana
+# de 5h igual que las del panel. Verificado contra los 10 procesos reales de
+# esta maquina el 25/8/2026.
+CLAUDE_CODE_CLI_COMM = "claude"
+
+# Gracia entre el SIGTERM y el SIGKILL. El CLI cierra la sesion limpio si le
+# dan el TERM; el KILL es el equivalente al -Force de Stop-Process y solo va
+# para los que no se fueron solos.
+KILL_GRACE_S = 1.5
+
 
 def _kill_claude_code_processes() -> int:
     """Mata los procesos de Claude Code (CLI) que esten corriendo. No toca
@@ -279,9 +363,21 @@ def _kill_claude_code_processes() -> int:
 
     Devuelve cuantos mato, o -1 si no se pudo confirmar (no rompe la mascota
     por esto: se reporta el -1 tal cual en la pantalla completa).
+
+    Cada plataforma identifica al CLI de forma distinta, y no por capricho:
+    en Windows el nombre de proceso es ambiguo y hay que desempatar por ruta,
+    en macOS pasa exactamente lo contrario. Ver cada rama.
     """
-    if sys.platform != "win32":
-        return -1
+    if sys.platform == "win32":
+        return _kill_win32()
+    if sys.platform == "darwin":
+        return _kill_darwin()
+    return -1
+
+
+def _kill_win32() -> int:
+    """PowerShell + WMI. Ver CLAUDE_CODE_CLI_MARKER para por que el filtro es
+    por ruta y no por nombre."""
     # -Filter "Name = 'claude.exe'" acota en la consulta WMI ANTES del
     # substring match. Sin eso, el propio powershell.exe que ejecuta esta
     # consulta calza en el filtro: su CommandLine incluye, literal, el texto
@@ -305,6 +401,70 @@ def _kill_claude_code_processes() -> int:
         return int(r.stdout.strip() or 0)
     except Exception:
         return -1
+
+
+def _pids_darwin() -> list:
+    """PIDs de las sesiones de Claude Code vivas en esta Mac.
+
+    Separado de _kill_darwin() a proposito: es la unica forma de auditar el
+    filtro sin matar nada. Ver la seccion de macOS del README.
+
+    Devuelve None si no se pudo consultar (que _kill_darwin traduce al -1 del
+    contrato), lista vacia si no habia ninguna.
+    """
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,comm="],
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+
+    yo = os.getpid()
+    pids = []
+    for linea in r.stdout.splitlines():
+        pid, _, comm = linea.strip().partition(" ")
+        if not pid.isdigit():
+            continue
+        # basename: cubre tanto la ruta completa del panel de VS Code como el
+        # 'claude' pelado del CLI nativo. Case-sensitive: ver
+        # CLAUDE_CODE_CLI_COMM para que es lo que se esta excluyendo.
+        if os.path.basename(comm.strip()) != CLAUDE_CODE_CLI_COMM:
+            continue
+        if int(pid) != yo:  # la mascota corre bajo python, pero es gratis
+            pids.append(int(pid))
+    return pids
+
+
+def _kill_darwin() -> int:
+    """SIGTERM y, a los que sobrevivan, SIGKILL.
+
+    Mucho mas simple que la rama de Windows: no hay WMI, y sobre todo no
+    existe el problema de que la propia consulta se automatchee (`ps` no
+    inyecta el patron de busqueda en su linea de comandos, `Get-CimInstance
+    -Command <script con el patron>` si).
+    """
+    pids = _pids_darwin()
+    if pids is None:
+        return -1
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if pids:
+        time.sleep(KILL_GRACE_S)
+
+    for pid in pids:
+        try:
+            os.kill(pid, 0)  # signal 0 = sondear, no mata
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    return len(pids)
 
 
 # Dos ventanas reales estan separadas por horas (5h) o dias (7d), asi que
@@ -624,11 +784,7 @@ class Pet(QtWidgets.QWidget):
             return
 
         # Notificacion del SO
-        try:
-            self.tray.showMessage("Claude Code", body,
-                                  QtWidgets.QSystemTrayIcon.Warning, 8000)
-        except Exception:
-            pass
+        _notify(self.tray, "Claude Code", body)
 
         _play_alert(level)
 
@@ -840,18 +996,84 @@ class Pet(QtWidgets.QWidget):
         p.end()
 
 
+def _hide_dock_icon() -> None:
+    """NSApplicationActivationPolicyAccessory, o sea el LSUIElement de un
+    bundle, pero sin bundle.
+
+    La mascota es un overlay que vive en la barra de menu: no tiene por que
+    ocupar un lugar en el Dock ni aparecer en Cmd+Tab. PySide6 no expone
+    setActivationPolicy:, asi que se lo manda por el runtime de ObjC via
+    ctypes — que ya viene en la stdlib, a diferencia de PyObjC.
+
+    Puramente cosmetico: si falla, queda el icono y nada mas.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        # objc_msgSend es variadica: hay que redeclarar argtypes por firma, o
+        # en arm64 los argumentos se pasan por el registro equivocado.
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app_cls = objc.objc_getClass(b"NSApplication")
+        shared = objc.objc_msgSend(app_cls,
+                                   objc.sel_registerName(b"sharedApplication"))
+
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                      ctypes.c_long]
+        objc.objc_msgSend(shared,
+                          objc.sel_registerName(b"setActivationPolicy:"), 1)
+    except Exception:
+        pass
+
+
+def _single_instance_guard():
+    """QSharedMemory como lock entre procesos, o None si ya hay una viva.
+
+    Con el atajo de shell:startup (o el launchd de macOS) mas un lanzamiento
+    manual terminarias con dos overlays superpuestos, peleando por
+    position.json y duplicando beeps: fired.json no protege contra la carrera
+    entre procesos.
+
+    En Windows el bloque de memoria lo libera el SO al morir el proceso, asi
+    que un crash no deja un lock huerfano. En POSIX (macOS y Linux) NO: el
+    segmento sobrevive al proceso que lo creo, y un unico crash dejaria el
+    create() fallando PARA SIEMPRE — la mascota no volveria a arrancar nunca
+    sin borrar el segmento a mano. El remedio estandar de Qt en Unix es
+    attach()+detach(): si el dueno murio, ese detach baja el refcount a cero
+    y el sistema libera el segmento, y el segundo create() ya pasa. Si el
+    dueno sigue vivo, su propia referencia mantiene el segmento y el segundo
+    create() falla igual — que es justo lo que queremos.
+    """
+    guard = QtCore.QSharedMemory("claude_pet_single_instance")
+    if guard.create(1):
+        return guard
+
+    if sys.platform != "win32":
+        guard.attach()
+        guard.detach()
+        if guard.create(1):
+            return guard
+
+    return None
+
+
 def main():
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
     app = QtWidgets.QApplication(sys.argv)
+    _hide_dock_icon()
 
-    # Instancia unica. Con el atajo de shell:startup mas un lanzamiento manual
-    # terminarias con dos overlays superpuestos, peleando por position.json y
-    # duplicando beeps (fired.json no protege contra la carrera entre procesos).
-    # En Windows el bloque de memoria lo libera el SO al morir el proceso, asi
-    # que un crash no deja un lock huerfano que impida volver a arrancar.
-    guard = QtCore.QSharedMemory("claude_pet_single_instance")
-    if not guard.create(1):
+    guard = _single_instance_guard()
+    if guard is None:
         return
     app._pet_guard = guard  # referencia viva: si lo junta el GC, se libera
 

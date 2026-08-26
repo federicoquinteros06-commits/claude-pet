@@ -1041,9 +1041,10 @@ class Pet(QtWidgets.QWidget):
                 f"{value:.0f}% {etiqueta} · no habia sesiones de Claude Code "
                 "corriendo en esta maquina.")
         else:
-            plural = "es" if n != 1 else ""
+            # el verbo tambien concuerda: "se cerraron 1 sesion" se leia mal
+            verbo, plural = ("cerraron", "es") if n != 1 else ("cerro", "")
             headline, detail = "CORTADO", (
-                f"{value:.0f}% {etiqueta} · se cerraron {n} sesion{plural} de "
+                f"{value:.0f}% {etiqueta} · se {verbo} {n} sesion{plural} de "
                 "Claude Code.")
         if repite:
             cada = max(1, int(self.cfg.get("usage_poll_seconds", 140)))

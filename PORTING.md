@@ -126,9 +126,14 @@ sido una dependencia nueva. Verificado: `lsappinfo` reporta `type="UIElement"`.
 El analisis lo daba como degradacion aceptable (`QApplication.beep()`
 repetido) y sugeria `afplay` o PyObjC como mejora opcional. Se hizo con
 `afplay`, porque lo que se perdia no era cosmetico: con el beep generico,
-aviso y alarma **suenan igual** y solo se distinguen contando beeps. Ping+Glass
-para aviso (dos notas), Sosumi x3 para alarma (sirena). Sin dependencias
-nuevas.
+aviso y alarma **suenan igual** y solo se distinguen contando beeps.
+
+El primer intento (Ping+Glass / Sosumi x3) tampoco servia, y por el mismo
+motivo de fondo: los tres son campanitas agudas, asi que el problema seguia
+intacto. La eleccion tiene que ser por **timbre**. Quedo Tink+Glass para
+aviso (agudo y breve) y Funk<->Basso x2 para alarma (alterna grave/medio,
+insiste), que es la traduccion mas cercana a ALERT_TONES de Windows. Probado
+a oido el 26/8/2026. Sin dependencias nuevas.
 
 ## Tabla final
 

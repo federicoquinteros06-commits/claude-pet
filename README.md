@@ -246,7 +246,12 @@ La primera vez puede pedir permiso en Ajustes del Sistema -> Notificaciones.
 **El sonido usa `afplay`.** No hay equivalente a `winsound.Beep(freq, ms)` en
 la stdlib, pero con los `.aiff` del sistema se conserva lo que importa: que
 aviso y alarma suenen **distinto**, no solo una cantidad distinta de veces del
-mismo beep. Ping+Glass para aviso, Sosumi x3 para alarma.
+mismo beep. Tink+Glass para aviso, Funk<->Basso x2 para alarma.
+
+La eleccion es por **timbre**, no por volumen: el primer intento fue
+Ping+Glass / Sosumi x3 y no servia, porque los tres son campanitas agudas y
+sin mirar la pantalla no se distinguia un aviso de una alarma. Probado a oido
+el 26/8/2026.
 
 **La instancia unica necesitaba un fix.** El comentario original decia que en
 Windows el SO libera el bloque de `QSharedMemory` al morir el proceso, asi que

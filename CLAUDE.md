@@ -261,7 +261,10 @@ información que se necesita a las apuradas.
   subiendo para aviso, sirena alternada x3 para alarma.
 - **macOS** (25/8/2026): no hay equivalente a `winsound.Beep(freq, ms)` en la
   stdlib, así que va `afplay` sobre los `.aiff` del sistema (`MAC_SOUNDS`):
-  Ping+Glass para aviso, Sosumi x3 para alarma. Sin dependencias nuevas.
+  Tink+Glass para aviso, Funk↔Basso x2 para alarma. Sin dependencias nuevas.
+  **Elegir por timbre, no por volumen**: el primer intento fue Ping+Glass /
+  Sosumi x3 y hubo que cambiarlo porque los tres son campanitas agudas y no se
+  distinguía aviso de alarma sin mirar la pantalla.
 - **Linux y último recurso**: el beep de Qt repetido, mismo patrón de conteo
   que había antes de este cambio.
 

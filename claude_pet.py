@@ -233,12 +233,22 @@ ALERT_TONES = {
 # macOS no tiene equivalente a winsound.Beep(freq, ms) en la stdlib, pero si
 # trae `afplay` y un set de .aiff del sistema. Alcanza para conservar lo que
 # importa del diseno de Windows: que aviso y alarma suenen DISTINTO, no solo
-# una cantidad distinta de veces del mismo beep. Ping+Glass imita el timbre de
-# dos notas; Sosumi repetido hace de sirena.
+# una cantidad distinta de veces del mismo beep.
+#
+# La eleccion es por TIMBRE, no por volumen. El primer intento fue
+# Ping+Glass / Sosumi x3 y no servia: los tres son campanitas agudas, asi que
+# escuchandolos sin mirar la pantalla no se distinguia un aviso de una alarma
+# — exactamente el problema que se queria evitar. Probado a oido el 26/8/2026.
+#
+#   warn   Tink -> Glass       agudo y breve, se lo escucha y se sigue
+#   alarm  Funk <-> Basso x2   alterna grave/medio, insiste
+#
+# Es la traduccion mas cercana a ALERT_TONES de Windows (dos notas subiendo
+# para aviso, sirena alternada para alarma).
 MAC_SOUNDS_DIR = "/System/Library/Sounds"
 MAC_SOUNDS = {
-    "warn":  ["Ping", "Glass"],
-    "alarm": ["Sosumi"] * 3,
+    "warn":  ["Tink", "Glass"],
+    "alarm": ["Funk", "Basso"] * 2,
 }
 
 

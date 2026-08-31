@@ -602,6 +602,38 @@ con `usage.json` de hacia 15.7h — o sea la mascota tampoco tenia dato
 confiable. Se recupero solo con el reinicio, que dispara un poll inmediato:
 `ok: true`, `consecutive_failures: 0`. Transitorio, como el caso de AVG.
 
+## Poller: jitter al arrancar para separar el poll inmediato del boot (30/8)
+
+Reportado como "cada vez que reinicio la compu no arranca bien la mascota".
+No era un bug del arranque en si: `poller_state.json` tenia
+`next_retry_in: 3600` — un 429 con `Retry-After: 3600` (contra el ~300s
+habitual medido el 25/8), la mascota sin dato fresco por una hora entera
+justo al reiniciar, que es cuando mas se la mira.
+
+Cada reinicio de la mascota dispara un poll inmediato (a proposito, para
+tener dato fresco al toque) — pero en un reboot de Windows todo lo demas que
+habla con el mismo endpoint (VS Code, otras sesiones de Claude Code, el
+panel de Usage) tambien despierta en el mismo instante. Sin jitter, la
+mascota es sistematicamente una de las requests que revienta el budget de
+6/ventana justo cuando el usuario la esta mirando recien arrancada.
+
+Fix: `STARTUP_JITTER_MAX = 30` + `startup_jitter()` en `claude_pet_usage.py`
+— `_loop()` espera un random de 0-30s antes del primer poll del proceso, en
+vez de dispararlo en el instante exacto del boot. Sigue siendo "dato fresco
+al reiniciar" (llega dentro del primer medio minuto, no en el proximo ciclo
+de 140s), pero ya no coincide milimetricamente con todo lo demas que
+despierta en ese instante. No es garantia absoluta contra el 429 al boot,
+baja la chance de colision, no la elimina.
+
+Verificado en vivo: mate el proceso que seguia bloqueado hasta las 19:25:37
+por el `Retry-After` viejo, y arranque uno nuevo a las 19:27:44. Con el
+jitter aplicado, polleo solo ~23s despues y salio bien al primer intento —
+`poller_state.json` paso a `ok: true, consecutive_failures: 0`.
+
+Tests: 2 nuevos en `tests/test_poller_backoff.py` (bounds del jitter, y que
+`_loop` lo espera antes de tocar la red). Suite completa: **126 tests, 0
+fallos.**
+
 ## Mascota invisible por perder el topmost real, no el flag de Qt (31/8)
 
 Segundo "no veo la mascota", causa distinta a la del 28/8: el proceso estaba

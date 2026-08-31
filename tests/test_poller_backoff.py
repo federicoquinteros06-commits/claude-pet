@@ -186,3 +186,35 @@ def test_default_deja_margen_de_recuperacion():
     assert usage.MIN_POLL_SECONDS == 110
     assert usage.DEFAULT_POLL_SECONDS == 140
     assert usage.poll_interval({}) == 140
+
+
+# --------------------------------------- jitter de arranque (colision al boot)
+
+def test_startup_jitter_esta_acotado():
+    """random.uniform es inclusive en el limite inferior; no debe pasarse del
+    superior. 200 muestras para que un off-by-one en el rango no pase de
+    casualidad."""
+    for _ in range(200):
+        j = usage.startup_jitter()
+        assert 0 <= j <= usage.STARTUP_JITTER_MAX
+
+
+def test_loop_espera_el_jitter_antes_del_primer_poll(monkeypatch):
+    """El jitter tiene que ser lo primero que hace _loop -- antes de tocar la
+    red siquiera -- para separar el proceso del instante exacto del boot."""
+    monkeypatch.setattr(usage, "startup_jitter", lambda: 7.5)
+    monkeypatch.setattr(usage, "poll_once", lambda: True)
+
+    sleeps = []
+
+    def _sleep(secs):
+        sleeps.append(secs)
+        if len(sleeps) >= 2:
+            raise SystemExit  # corta el "while True" tras un ciclo completo
+
+    monkeypatch.setattr(usage.time, "sleep", _sleep)
+
+    with pytest.raises(SystemExit):
+        usage._loop(140)
+
+    assert sleeps[0] == 7.5

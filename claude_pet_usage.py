@@ -24,6 +24,7 @@ statusLine queda como fallback. No lo borres.
 
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -95,6 +96,18 @@ MIN_POLL_SECONDS = 110
 # maxima; a 140s, 26 por hora con 140s. Bajar el intervalo no trae mas datos,
 # los reparte peor.
 DEFAULT_POLL_SECONDS = 140
+
+# Cada reinicio de la mascota dispara un poll inmediato (a proposito, para
+# tener dato fresco al toque) -- pero en un reboot de Windows todo lo demas
+# que habla con el mismo endpoint (VS Code, otras sesiones de Claude Code, el
+# panel de Usage) tambien despierta en el mismo instante. Sin jitter, la
+# mascota es sistematicamente una de las requests que revienta el budget de
+# 6/ventana justo cuando el usuario la esta mirando recien arrancada -- visto
+# en vivo el 30/8: 429 con Retry-After de 1h al boot, mascota sin dato por una
+# hora entera. STARTUP_JITTER_MAX separa el primer poll del instante exacto
+# del boot sin resignar el "dato fresco al reiniciar": sigue llegando dentro
+# del primer medio minuto, no en el proximo ciclo de 140s.
+STARTUP_JITTER_MAX = 30
 
 STATE_PATH = PET_DIR / "poller_state.json"
 LAST_ERROR = None       # motivo del ultimo fallo, para diagnostico
@@ -304,7 +317,15 @@ def poll_once() -> bool:
     return True
 
 
+def startup_jitter() -> float:
+    """Segundos a esperar antes del primer poll del proceso. Ver
+    STARTUP_JITTER_MAX arriba -- separada en su propia funcion para poder
+    fijarla en los tests sin parchear random.uniform a mano."""
+    return random.uniform(0, STARTUP_JITTER_MAX)
+
+
 def _loop(interval: int) -> None:
+    time.sleep(startup_jitter())
     backoff = interval
     fails = 0
     while True:

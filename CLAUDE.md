@@ -564,6 +564,91 @@ los 5 docs de test y los dos `.md`. Lo que se encontró y arregló:
 
 Suite completa: **109 tests, 0 fallos.**
 
+## Mascota invisible por un monitor desconectado (28/8)
+
+Sintoma reportado: "no veo la mascota". El proceso estaba vivo (`pythonw.exe`
+con `claude_pet.py`), el tray tambien — pero cero pixeles en pantalla.
+
+Causa: `position.json` tenia `x: -264`, guardado cuando habia un monitor a la
+izquierda del primario. Al quedar un solo monitor (`0..1920`), esa region del
+escritorio virtual dejo de existir, y con 262px de ancho la mascota quedaba
+enteramente afuera (`-264 + 262 = -2`). `_restore_position()` hacia `move()`
+con la posicion guardada **sin validarla contra las pantallas actuales**.
+
+**Un proceso vivo dibujado fuera de pantalla es indistinguible de uno que no
+arranco** — y no se puede arreglar arrastrandola, porque no hay de donde
+agarrarla. Antes de revisar el codigo, comparar `position.json` contra
+`[System.Windows.Forms.Screen]::AllScreens`.
+
+Fix: `clamp_to_screens()` (funcion pura de modulo, junto a `_play_alert`) mas
+`Pet._screen_areas()` que traduce de `QScreen` a tuplas. Respeta una posicion
+que ya cae adentro — incluida una mordiendo el borde a proposito, que es una
+decision del usuario al arrastrar — y solo reubica cuando queda menos de
+`MIN_VISIBLE` (40px) dentro de **alguna** pantalla. El rescate va a
+`screens[0]`, por eso `_screen_areas()` pone la primaria al frente a mano:
+`QApplication.screens()` no promete ningun orden.
+
+La aritmetica se separo de Qt justamente para poder testearla:
+`tests/test_position.py`, 12 casos, incluido el caso real de esta fecha.
+`_screen_areas()` sigue sin cobertura, como todo lo demas que toca Qt.
+
+Verificado en vivo: tras el reinicio, `GetWindowRect` devolvio
+`L=0 T=40 R=262 B=192`, dentro del monitor y con `IsWindowVisible` en `True`.
+Suite completa: **124 tests, 0 fallos.**
+
+De paso, el poller estaba en `429` con `consecutive_failures: 4` y un
+`Retry-After: 3600` que el codigo obedecio (cae dentro de `RETRY_AFTER_MAX`),
+con `usage.json` de hacia 15.7h — o sea la mascota tampoco tenia dato
+confiable. Se recupero solo con el reinicio, que dispara un poll inmediato:
+`ok: true`, `consecutive_failures: 0`. Transitorio, como el caso de AVG.
+
+## Mascota invisible por perder el topmost real, no el flag de Qt (31/8)
+
+Segundo "no veo la mascota", causa distinta a la del 28/8: el proceso estaba
+vivo, `position.json` bien (dentro de pantalla), y Windows reportaba la
+ventana `visible=True` — pero el z-order real (recorrido con
+`GetWindow`/`GW_HWNDNEXT`) la tenia en el puesto #11, detras de Chrome, VS
+Code y Excel, PESE a que su `WS_EX_TOPMOST` seguia marcado (confirmado con
+`GetWindowLong`). El bit se pone una vez al mostrar la ventana pero no
+garantiza la posicion real en el z-order; algun evento (otra app pidiendo
+topmost, un cambio de pantalla, el snipping tool activandose) la entierra
+igual. `self.raise_()` de Qt no alcanza: en Windows equivale a `HWND_TOP`,
+que solo reordena dentro de la banda en la que la ventana YA esta — si se
+cayo a la banda normal, se queda ahi.
+
+Diagnostico con una captura de pantalla y hit-test (`WindowFromPoint` +
+`GetAncestor`) sobre el punto exacto donde vive la mascota: confirmo que
+Chrome, no topmost, era el dueño real de esos pixeles.
+
+Fix: `_reassert_topmost()` en `claude_pet.py`, llamada desde `tick()` cada
+1s — `SetWindowPos(HWND_TOPMOST)` por ctypes, asi el drift dura como maximo
+un tick en vez de hasta el proximo reinicio manual.
+
+**Bug real en el primer intento del fix, atajado por un test contra la API
+de verdad, no mockeada:** `SetWindowPos` de ctypes sin `argtypes`
+declarados marshalea el `HWND_TOPMOST` (-1) como `int` de 32 bits en vez de
+puntero de 64 — la llamada no tira excepcion (`SetWindowPos` devuelve
+`BOOL` igual) pero no mueve nada. Los tests que mockean `ctypes.windll`
+entero pasaban igual porque nunca ejercitan el marshaling real; el que crea
+una ventana nativa de verdad (clase `STATIC`, sin `RegisterClass`) lo
+atrapo. Fix real: declarar `argtypes`/`restype` sobre `SetWindowPos` al
+importar el modulo.
+
+Ese mismo test fue flaky al principio (1 de 3 corridas fallaba) contra una
+ventana invisible y sin bombeo de mensajes — se corrigio con `WS_VISIBLE` +
+un pump minimo de `PeekMessage`/`DispatchMessage`, que se ajusta a la
+condicion real (la mascota siempre es visible y tiene el loop de Qt
+bombeando mensajes via `app.exec()`), no la elude.
+
+Verificado en vivo contra el proceso real: forzando el drift a mano
+(`SetWindowPos(HWND_NOTOPMOST)`) el `exStyle` paso de `0x80080` a `0x80088`
+solo, dentro de un tick de 2s, y el hit-test final confirmo que los pixeles
+donde vive la mascota son de verdad suyos.
+
+Tests: 4 nuevos en `tests/test_reassert_topmost.py` (3 mockeados para la
+logica + no-op fuera de Windows, 1 contra una ventana nativa real, la que
+atrapo el bug de arriba). Suite completa: **130 tests, 0 fallos.**
+
 ## Cobertura de tests: lo que NO está cubierto
 
 Todo lo que es Python puro tiene tests (`AlertEngine`, `read_sessions`, el

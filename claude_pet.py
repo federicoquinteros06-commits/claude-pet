@@ -32,6 +32,11 @@ CONFIG_PATH = PET_DIR / "config.json"
 FIRED_PATH = PET_DIR / "fired.json"
 POS_PATH = PET_DIR / "position.json"
 
+# Cuanto de la mascota tiene que quedar dentro de una pantalla para contarla
+# como alcanzable con el mouse. Con menos que esto no hay de donde agarrarla
+# para arrastrarla de vuelta, que es el unico modo de moverla que hay.
+MIN_VISIBLE = 40
+
 FRESH_WINDOW = 300  # una sesion cuenta como viva si escribio hace < 5 min
 STALE_HINT = 90     # a partir de aca la mascota avisa que el dato envejece
 POLL_MS = 1000
@@ -53,6 +58,30 @@ try:
     HAS_WINSOUND = sys.platform == "win32"
 except ImportError:
     HAS_WINSOUND = False
+
+# ctypes.windll (exclusivo de Windows) para reafirmar el topmost real via
+# SetWindowPos -- ver _reassert_topmost. En mac/Linux es no-op.
+try:
+    import ctypes
+    from ctypes import wintypes
+    HAS_WINDLL = sys.platform == "win32"
+    if HAS_WINDLL:
+        # SetWindowPos recibe dos HWND, que en Windows de 64 bits son punteros
+        # de 8 bytes. Sin declarar argtypes, ctypes marshalea un Python int
+        # como C `int` de 4 bytes -- la llamada no tira excepcion (SetWindowPos
+        # devuelve BOOL igual), pero el HWND_TOPMOST que le llega al otro lado
+        # queda truncado/corrompido y no mueve la ventana a ningun lado. Visto
+        # en vivo el 31/8: con los tests mockeando ctypes.windll esto pasaba
+        # inadvertido -- el marshaling real solo se probo contra la API de
+        # verdad, no contra el mock.
+        ctypes.windll.user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.UINT,
+        ]
+        ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
+except ImportError:
+    HAS_WINDLL = False
 
 DEFAULT_CONFIG = {
     # Aviso (notif + sonido): 25/50/75/85. Alarma (+ pantalla completa): 90.
@@ -281,6 +310,46 @@ MAC_SOUNDS = {
 }
 
 
+def clamp_to_screens(x, y, w, h, screens):
+    """Corrige (x, y) para que la mascota caiga dentro de alguna pantalla.
+
+    `screens` son las areas disponibles como tuplas (sx, sy, sw, sh), con la
+    primaria PRIMERO: es el fallback cuando la posicion guardada ya no existe
+    en ningun monitor.
+
+    Existe porque la posicion se persiste en coordenadas absolutas del
+    escritorio virtual, que no son estables entre sesiones: un monitor
+    secundario a la izquierda del primario da coordenadas negativas, y al
+    desconectarlo esa region del escritorio desaparece. La mascota entonces
+    arranca dibujada donde ya no hay pantalla -- proceso vivo, cero pixeles
+    visibles, indistinguible de "no arranco". Visto en produccion el 28/8 con
+    x=-264 y 262px de ancho: ni un pixel adentro.
+
+    Una posicion que ya cae razonablemente adentro se devuelve intacta, para
+    no reacomodar a quien deliberadamente dejo la mascota mordiendo un borde.
+    """
+    if not screens:
+        return x, y  # sin pantallas que consultar no hay nada mejor que hacer
+
+    # Contra una mascota mas chica que el minimo, el minimo es ella misma:
+    # si no, un scale bajo la haria "invisible" siempre y se reubicaria sola
+    # en cada arranque.
+    need_w, need_h = min(MIN_VISIBLE, w), min(MIN_VISIBLE, h)
+
+    for sx, sy, sw, sh in screens:
+        vis_w = min(x + w, sx + sw) - max(x, sx)
+        vis_h = min(y + h, sy + sh) - max(y, sy)
+        if vis_w >= need_w and vis_h >= need_h:
+            return x, y
+
+    sx, sy, sw, sh = screens[0]
+    # Los max() de afuera ganan cuando la mascota es mas ancha o mas alta que
+    # la pantalla: la pegan al borde superior izquierdo en vez de empujarla
+    # a coordenadas negativas.
+    return (max(sx, min(x, sx + sw - w)),
+            max(sy, min(y, sy + sh - h)))
+
+
 def _play_alert(level: str) -> None:
     """Reproduce el patron de `level` en un hilo aparte.
 
@@ -349,6 +418,42 @@ def _notify(tray, title: str, body: str) -> None:
                          QtWidgets.QSystemTrayIcon.Warning, 8000)
     except Exception:
         pass
+
+
+_SWP_NOMOVE = 0x0002
+_SWP_NOSIZE = 0x0001
+_SWP_NOACTIVATE = 0x0010
+_HWND_TOPMOST = -1
+
+
+def _reassert_topmost(widget) -> None:
+    """Vuelve a insertar `widget` al frente de la banda topmost de Windows.
+
+    Visto en vivo el 31/8: la mascota quedo invisible con el proceso vivo y
+    bien posicionada -- el z-order real (recorrido con GetWindow/GW_HWNDNEXT)
+    la tenia en el puesto #11, detras de Chrome, VS Code y Excel, PESE a que
+    su WS_EX_TOPMOST seguia marcado (confirmado con GetWindowLong). El bit se
+    pone una vez al mostrar la ventana pero no garantiza la posicion real;
+    algun evento (otra app pidiendo topmost, un cambio de pantalla, el
+    snipping tool activandose) la entierra igual.
+
+    `self.raise_()` de Qt no alcanza: en Windows equivale a HWND_TOP, que
+    solo reordena dentro de la banda en la que la ventana YA esta -- si se
+    cayo a la banda normal, se queda ahi. Por eso esto llama a SetWindowPos
+    con HWND_TOPMOST directo (lo mismo que la reinsercion manual que la trajo
+    de vuelta en el incidente), desde tick() cada 1s: barato, y así el drift
+    dura como maximo un tick en vez de hasta el proximo reinicio manual.
+    """
+    if not HAS_WINDLL:
+        return
+    try:
+        hwnd = int(widget.winId())
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, _HWND_TOPMOST, 0, 0, 0, 0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
+        )
+    except Exception:
+        pass  # nunca romper el tick por esto
 
 
 # Segmento de ruta EXCLUSIVO del binario nativo que lanza la extension de
@@ -854,13 +959,32 @@ class Pet(QtWidgets.QWidget):
         save_json(CONFIG_PATH, stored)
 
     # ------------------------------------------------------------ posicion
+    def _screen_areas(self):
+        """Areas disponibles de todas las pantallas, la primaria primero.
+
+        `QApplication.screens()` no promete ningun orden, y clamp_to_screens
+        usa la primera como destino de rescate -- asi que la primaria se pone
+        al frente a mano.
+        """
+        app = QtWidgets.QApplication
+        primary = app.primaryScreen()
+        ordered = ([primary] if primary else []) + [
+            s for s in app.screens() if s is not primary
+        ]
+        return [(g.x(), g.y(), g.width(), g.height())
+                for g in (s.availableGeometry() for s in ordered)]
+
     def _restore_position(self):
         pos = load_json(POS_PATH, None)
         if pos:
-            self.move(int(pos.get("x", 60)), int(pos.get("y", 60)))
+            x, y = int(pos.get("x", 60)), int(pos.get("y", 60))
         else:
             screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
-            self.move(screen.right() - self.width() - 30, screen.top() + 40)
+            x, y = screen.right() - self.width() - 30, screen.top() + 40
+        # La posicion guardada puede apuntar a un monitor que ya no esta
+        # conectado; sin este clamp la mascota arranca fuera de pantalla.
+        self.move(*clamp_to_screens(x, y, self.width(), self.height(),
+                                    self._screen_areas()))
 
     def _save_position(self):
         save_json(POS_PATH, {"x": self.x(), "y": self.y()})
@@ -893,6 +1017,7 @@ class Pet(QtWidgets.QWidget):
         return "calm"
 
     def tick(self):
+        _reassert_topmost(self)
         self.state = read_sessions()
         five = self.state.get("five_hour")
         pct = (five or {}).get("used_percentage")

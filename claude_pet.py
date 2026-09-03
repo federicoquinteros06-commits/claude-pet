@@ -989,6 +989,32 @@ class Pet(QtWidgets.QWidget):
     def _save_position(self):
         save_json(POS_PATH, {"x": self.x(), "y": self.y()})
 
+    def _reclamp_position(self):
+        """Como _restore_position, pero pensada para correr en cada tick.
+
+        Visto en vivo el 3/9: la mascota llevaba corriendo desde el 31/8
+        cuando se desconecto el monitor secundario CON EL PROCESO YA VIVO
+        -- distinto del caso del 28/8, donde el monitor faltaba desde el
+        arranque. _restore_position() solo corre una vez en __init__, asi
+        que nunca se entera de un monitor que desaparece a mitad de sesion:
+        la ventana quedo en (-297,398), fuera de cualquier pantalla, con la
+        maquina bloqueada (no apagada) de por medio -- mismo sintoma que el
+        bug del topmost, "proceso vivo, cero pixeles visibles".
+
+        No se mete mientras el usuario esta arrastrando (self.drag_offset),
+        para no pelearle la mano a mitad de un arrastre. Si corrige algo,
+        persiste la posicion nueva -- si no, position.json queda apuntando
+        a un lugar que la ventana ya no ocupa, y el proximo arranque
+        clampearia igual pero desde un valor viejo y enganoso.
+        """
+        if self.drag_offset is not None:
+            return
+        x, y = clamp_to_screens(self.x(), self.y(), self.width(), self.height(),
+                                self._screen_areas())
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+            self._save_position()
+
     # ----------------------------------------------------------- interaccion
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -1018,6 +1044,7 @@ class Pet(QtWidgets.QWidget):
 
     def tick(self):
         _reassert_topmost(self)
+        self._reclamp_position()
         self.state = read_sessions()
         five = self.state.get("five_hour")
         pct = (five or {}).get("used_percentage")

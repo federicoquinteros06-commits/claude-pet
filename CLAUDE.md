@@ -681,6 +681,38 @@ Tests: 4 nuevos en `tests/test_reassert_topmost.py` (3 mockeados para la
 logica + no-op fuera de Windows, 1 contra una ventana nativa real, la que
 atrapo el bug de arriba). Suite completa: **130 tests, 0 fallos.**
 
+## Mascota invisible, tercera vez: el monitor se va con el proceso ya vivo (3/9)
+
+Reportado como "estuvo bloqueada (no apagada) y ahora volvi y no la veo".
+Misma familia que el bug del 28/8 (`position.json` apuntando a un monitor
+que ya no existe: esta vez `x: -297`, con un monitor secundario a la
+izquierda del primario que se desconecto), pero un gatillo distinto: el
+proceso llevaba corriendo desde el 31/8 y el monitor desaparecio **a mitad
+de sesion**, con la maquina bloqueada de por medio. `_restore_position()`
+con su `clamp_to_screens()` solo corre una vez, en `Pet.__init__` — nunca
+se entera de que una pantalla desaparecio despues de arrancar. El
+`GetWindowRect` en vivo confirmo la ventana en `(-297,398)-(-35,550)`,
+enteramente fuera de las `0..1920` que quedaban.
+
+Mismo patron que el fix del topmost del 31/8, aplicado al mismo problema de
+fondo: `_reclamp_position()`, llamada desde `tick()` junto a
+`_reassert_topmost()`, reusa `clamp_to_screens()` cada 1s en vez de
+confiar en que la geometria de pantallas no cambia nunca. No se mete
+mientras el usuario arrastra (`self.drag_offset`), y si corrige algo
+tambien persiste la posicion nueva — si no, `position.json` queda
+apuntando a un lugar que la ventana ya no ocupa.
+
+Sin test automatizado (es un metodo de `Pet`, atado a `self.x()`/`move()`/
+`_screen_areas()` reales de Qt) — la logica de fondo (`clamp_to_screens`)
+ya esta cubierta en `tests/test_position.py`; esto es solo el wiring de
+"correlo tambien en cada tick", mismo criterio que el resto de lo que toca
+Qt en este archivo. Verificado en vivo, dos veces: primero el rescate
+manual (`SetWindowPos` a mano) para destrabar al usuario al toque, despues
+forzando el mismo drift contra el proceso YA con el fix corriendo —
+`GetWindowRect` confirmo la correccion sola, sin reinicio, dentro de un
+tick de 2s, y `position.json` quedo consistente con lo que se ve en
+pantalla.
+
 ## Cobertura de tests: lo que NO está cubierto
 
 Todo lo que es Python puro tiene tests (`AlertEngine`, `read_sessions`, el
